@@ -1,0 +1,184 @@
+#!/usr/bin/env node
+'use strict';
+// firefox-use - browser control for Claude Code, backed by Firefox's WebDriver BiDi.
+
+const path = require('path');
+const { spawnSync } = require('child_process');
+const launcher = require('../src/launcher');
+const { McpServer } = require('../src/mcp');
+const { BrowserHandle, buildTools } = require('../src/tools');
+const { FirefoxBrowser } = require('../src/browser');
+const pkg = require('../package.json');
+
+const args = process.argv.slice(2);
+const command = args[0] && !args[0].startsWith('-') ? args.shift() : 'mcp';
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return undefined;
+  const next = args[i + 1];
+  return next && !next.startsWith('--') ? next : true;
+}
+
+const options = {
+  headless: flag('headless') === true || process.env.FIREFOX_USE_HEADLESS === '1',
+  port: flag('port') ? Number(flag('port')) : undefined,
+  profile: typeof flag('profile') === 'string' ? path.resolve(flag('profile')) : undefined,
+};
+
+const HELP = `firefox-use ${pkg.version} - drive Firefox from Claude Code
+
+Usage: firefox-use <command> [options]
+
+Commands:
+  mcp                 Run the MCP server on stdio (default; this is what Claude Code starts)
+  start [url]         Launch Firefox with WebDriver BiDi enabled
+  stop                Quit the Firefox instance started by firefox-use
+  restart             Stop and start again, clearing a stale automation session
+  status              Show whether Firefox is running, plus the open tabs
+  open <url>          Open a URL in the running instance (starting it if needed)
+  shot <file> [url]   Save a screenshot to a PNG file
+  install             Register this server with Claude Code (claude mcp add)
+  doctor              Check Firefox, the profile, the port and the BiDi handshake
+
+Options:
+  --headless          Run Firefox without a window
+  --port <n>          BiDi port (default 9222, or $FIREFOX_USE_PORT)
+  --profile <dir>     Firefox profile directory (default ~/.firefox-use/profile)
+`;
+
+async function withBrowser(fn) {
+  const browser = await FirefoxBrowser.open(options);
+  try {
+    return await fn(browser);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function main() {
+  switch (command) {
+    case 'mcp': {
+      const handle = new BrowserHandle(options);
+      const server = new McpServer({
+        name: 'firefox-use',
+        version: pkg.version,
+        tools: buildTools(handle),
+        onShutdown: () => handle.close(),
+      });
+      server.start();
+      server.log(`ready (firefox ${launcher.findFirefox() || 'NOT FOUND'})`);
+      return new Promise(() => {}); // run until stdin closes or a signal arrives
+    }
+
+    case 'start': {
+      const url = args.find((a) => !a.startsWith('--'));
+      const state = await launcher.ensureRunning({ ...options, url });
+      console.log(`Firefox ${state.launched ? 'started' : 'already running'}: pid ${state.pid}, port ${state.port}`);
+      console.log(`profile: ${state.profile}`);
+      return;
+    }
+
+    case 'stop': {
+      const stopped = await launcher.stop();
+      console.log(stopped ? 'Firefox stopped.' : 'Nothing to stop.');
+      return;
+    }
+
+    case 'restart': {
+      await launcher.stop();
+      await new Promise((r) => setTimeout(r, 1000));
+      const state = await launcher.launch(options);
+      console.log(`Firefox restarted: pid ${state.pid}, port ${state.port}`);
+      return;
+    }
+
+    case 'status': {
+      const st = await launcher.status();
+      console.log(`firefox: ${st.reachable ? 'running' : 'not running'} (pid ${st.pid ?? '-'}, port ${st.port})`);
+      console.log(`profile: ${st.profile}`);
+      console.log(`log:     ${st.logFile}`);
+      if (!st.reachable) return;
+      await withBrowser(async (b) => {
+        const info = await b.pageInfo();
+        console.log('tabs:');
+        for (const t of info.tabs) console.log(`${t.current ? '*' : ' '} [${t.index}] ${t.url}`);
+      });
+      return;
+    }
+
+    case 'open': {
+      const url = args.find((a) => !a.startsWith('--'));
+      if (!url) throw new Error('usage: firefox-use open <url>');
+      await withBrowser(async (b) => {
+        const res = await b.navigate(url);
+        console.log(`Loaded ${res.url}`);
+      });
+      return;
+    }
+
+    case 'shot': {
+      const positional = args.filter((a) => !a.startsWith('--'));
+      const file = positional[0];
+      if (!file) throw new Error('usage: firefox-use shot <file.png> [url]');
+      await withBrowser(async (b) => {
+        if (positional[1]) await b.navigate(positional[1]);
+        const shot = await b.screenshot({ fullPage: flag('full') === true });
+        require('fs').writeFileSync(file, Buffer.from(shot.data, 'base64'));
+        console.log(`Saved ${file}`);
+      });
+      return;
+    }
+
+    case 'install': {
+      const entry = path.resolve(__dirname, 'firefox-use');
+      const scope = typeof flag('scope') === 'string' ? flag('scope') : 'user';
+      const res = spawnSync('claude', ['mcp', 'add', 'firefox', '--scope', scope, '--', process.execPath, entry, 'mcp'], {
+        stdio: 'inherit',
+      });
+      if (res.error) throw new Error(`could not run claude: ${res.error.message}`);
+      if (res.status !== 0) throw new Error(`claude mcp add exited with ${res.status}`);
+      console.log('\nRegistered. Start a new Claude Code session and ask it to use the firefox_* tools.');
+      return;
+    }
+
+    case 'doctor': {
+      const bin = launcher.findFirefox();
+      console.log(`firefox binary: ${bin || 'NOT FOUND (set FIREFOX_BIN)'}`);
+      if (!bin) process.exitCode = 1;
+      const st = await launcher.status();
+      console.log(`port ${st.port}: ${st.reachable ? 'open' : 'closed'}`);
+      console.log(`profile: ${st.profile}`);
+      const browser = await FirefoxBrowser.open(options);
+      const version = await browser.evaluate('navigator.userAgent');
+      const info = await browser.pageInfo();
+      console.log(`BiDi session: ok (${browser.sessionId || 'existing session'})`);
+      console.log(`user agent: ${version}`);
+      console.log(`tabs: ${info.tabs.length}`);
+      await browser.close();
+      console.log('All checks passed.');
+      return;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      console.log(HELP);
+      return;
+
+    case 'version':
+    case '--version':
+      console.log(pkg.version);
+      return;
+
+    default:
+      console.error(`unknown command: ${command}\n`);
+      console.log(HELP);
+      process.exitCode = 1;
+  }
+}
+
+main().catch((err) => {
+  console.error(`firefox-use: ${err.message}`);
+  process.exit(1);
+});
