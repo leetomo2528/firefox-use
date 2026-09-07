@@ -625,3 +625,287 @@ test('clicks drained by an abandoned capture land on the frame that ended the ru
   assert.equal(rec.frames.length, 2);
   assert.deepEqual(rec.frames[1].events, [click], 'the click is not swallowed with the dropped frame');
 });
+
+// --- export cost: memory and latency --------------------------------------
+
+const zlib = require('node:zlib');
+const realGifenc = require('../src/gifenc');
+
+// A gifenc whose decoded frames are watchable. Each one records when it was
+// handed to resizeRgba and reports any read that lands after that: a decoded
+// 1280x800 frame is 4 MB of RGBA, so export has to let go of one the moment it
+// has been downscaled instead of keeping all 120 alive to read widths later.
+function watchedGifenc(widths) {
+  const meta = new WeakMap();
+  const watch = { order: [], violations: [], live: 0, peakLive: 0 };
+  let seen = 0;
+  const enc = fakeGifenc({
+    decodePng(buf) {
+      enc.calls.decodePng.push(buf);
+      const id = ++seen;
+      const full = widths[id - 1] || widths[widths.length - 1];
+      let released = false;
+      watch.order.push(`decode${id}`);
+      watch.live += 1;
+      if (watch.live > watch.peakLive) watch.peakLive = watch.live;
+      const pixels = { width: full, height: Math.round((full * 1000) / 1600), data: buf };
+      const frame = new Proxy(pixels, {
+        get(target, prop) {
+          if (released) watch.violations.push(`frame ${id}.${String(prop)} read after it was resized`);
+          return target[prop];
+        },
+      });
+      meta.set(frame, {
+        id,
+        release() { if (released) return; released = true; watch.live -= 1; },
+      });
+      return frame;
+    },
+    resizeRgba(frame, targetWidth) {
+      enc.calls.resizeRgba.push({ targetWidth });
+      const info = meta.get(frame);
+      const out = { width: targetWidth, height: Math.round((frame.height * targetWidth) / frame.width), data: frame.data };
+      watch.order.push(`resize${info ? info.id : '?'}`);
+      if (info) info.release();
+      return out;
+    },
+  });
+  enc.watch = watch;
+  return enc;
+}
+
+async function record(recorder, session, clock, ticks) {
+  await recorder.run(session, { action: 'start_recording', tabId: 1 });
+  await clock.tick(ticks);
+  await recorder.run(session, { action: 'stop_recording', tabId: 1 });
+}
+
+test('export decodes and downscales one frame at a time and drops the full-size pixels', async () => {
+  const enc = watchedGifenc([1600]);
+  const { recorder, session, clock } = setup({ gifenc: enc });
+  await record(recorder, session, clock, 2);
+  assert.equal(recorder.stateFor(1).frames.length, 4);
+
+  const out = await recorder.run(session, { action: 'export', tabId: 1, download: true });
+  assert.match(out, /Exported 4 frame\(s\) of tab 1/);
+  assert.match(out, /Frames kept: 4/);
+  assert.deepEqual(
+    enc.watch.order,
+    ['decode1', 'resize1', 'decode2', 'resize2', 'decode3', 'resize3', 'decode4', 'resize4'],
+    'one pass: a frame is downscaled before the next one is decoded'
+  );
+  assert.deepEqual(enc.watch.violations, [], 'a resized frame is never read again');
+  assert.equal(enc.watch.peakLive, 1, 'only one full-size frame is alive at a time');
+  assert.equal(enc.watch.live, 0, 'every decoded frame was released');
+});
+
+test('the downscale factor still comes from each frame own full size', async () => {
+  const events = [{ type: 'click', x: 10, y: 20, x2: null, y2: null, label: 'click Save' }];
+  const session = new FakeSession({ responses: { callJson: [{ total: 0, events: [] }, { total: 1, events }] } });
+  // Frame 1 arrives at the target width already, frame 2 at twice it: the two
+  // frames must not share one scale factor.
+  const enc = watchedGifenc([800, 1600]);
+  const { recorder, clock } = setup({ session, gifenc: enc });
+  await recorder.run(session, { action: 'start_recording', tabId: 1 });
+  await clock.tick();
+  const out = await recorder.run(session, { action: 'export', tabId: 1, download: true });
+
+  assert.match(out, /Exported 2 frame\(s\)/);
+  assert.deepEqual(enc.calls.resizeRgba.map((c) => c.targetWidth), [800], 'the first frame needs no resize');
+  assert.deepEqual(enc.watch.violations, []);
+  const circle = enc.calls.drawOverlays[1].ops.find((op) => op.type === 'circle');
+  assert.deepEqual(
+    circle,
+    { type: 'circle', x: 5, y: 10, r: 11, color: '#ff8c00', fill: false, lineWidth: 2 },
+    'the click scales by 1600 -> 800, the size that frame was decoded at'
+  );
+});
+
+test('export awaits between frames instead of running the whole encode in one turn', async () => {
+  let yields = 0;
+  const atDecode = [];
+  const enc = fakeGifenc({
+    decodePng(buf) {
+      enc.calls.decodePng.push(buf);
+      atDecode.push(yields);
+      return { width: 1600, height: 1000, data: buf };
+    },
+  });
+  const { recorder, session, clock } = setup({ gifenc: enc, yieldFn: async () => { yields += 1; } });
+  await record(recorder, session, clock, 2);
+
+  await recorder.run(session, { action: 'export', tabId: 1, download: true });
+  assert.deepEqual(atDecode, [1, 2, 3, 4], 'every frame starts on a fresh turn of the loop');
+  // 4 decodes + 4 overlay passes + one before quantize + one before encoding.
+  assert.ok(yields >= 10, `expected at least 10 yields, got ${yields}`);
+});
+
+test('a long export leaves room on the event loop for other calls', async () => {
+  let ticks = 0;
+  let stop = false;
+  const atDecode = [];
+  const enc = fakeGifenc({
+    decodePng(buf) {
+      enc.calls.decodePng.push(buf);
+      atDecode.push(ticks);
+      return { width: 1600, height: 1000, data: buf };
+    },
+  });
+  // No injected yieldFn: this is the real setImmediate path.
+  const { recorder, session, clock } = setup({ gifenc: enc });
+  await record(recorder, session, clock, 2);
+
+  const pump = () => { if (stop) return; ticks += 1; setImmediate(pump); };
+  setImmediate(pump);
+  await recorder.run(session, { action: 'export', tabId: 1, download: true });
+  stop = true;
+
+  assert.equal(atDecode.length, 4);
+  assert.ok(
+    atDecode[3] > atDecode[0],
+    `other work ran while the export was decoding (ticks per frame: ${atDecode.join(',')})`
+  );
+});
+
+// --- the output is unchanged ---------------------------------------------
+
+const CRC = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  return table;
+})();
+
+function pngChunk(type, data) {
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), Buffer.from(data)]);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(body.length - 4);
+  let c = 0xffffffff;
+  for (const byte of body) c = CRC[(c ^ byte) & 0xff] ^ (c >>> 8);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE((c ^ 0xffffffff) >>> 0);
+  return Buffer.concat([len, body, crc]);
+}
+
+// Smallest real PNG the decoder will take: 8-bit RGBA, filter 0 on every row.
+function rgbaPng(width, height, pixel) {
+  const stride = width * 4 + 1;
+  const raw = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const o = y * stride + 1 + x * 4;
+      const [r, g, b, a] = pixel(x, y);
+      raw[o] = r; raw[o + 1] = g; raw[o + 2] = b; raw[o + 3] = a;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+test('the streamed export writes the same bytes the all-at-once pipeline did', async () => {
+  const shots = [0, 1, 2].map((n) => ({
+    data: rgbaPng(40, 24, (x, y) => [(x * 7 + n * 40) & 255, (y * 11) & 255, (x * y + n * 3) & 255, 255]).toString('base64'),
+    mimeType: 'image/png',
+  }));
+  const session = new FakeSession({ responses: { screenshot: shots.slice() } });
+  // The real encoder, and a max width that forces a downscale.
+  const { recorder, clock, fs } = setup({ session, gifenc: realGifenc, maxWidth: 20 });
+  await record(recorder, session, clock, 1);
+  const frames = recorder.stateFor(1).frames;
+  assert.equal(frames.length, 3);
+
+  await recorder.run(session, { action: 'export', tabId: 1, download: true });
+  const written = fs.files.get(path.join(DIR, 'recording-1.gif'));
+  assert.ok(written && written.length, 'a GIF was written');
+
+  // The pipeline this replaced: decode everything, resize everything, then
+  // draw, quantize and encode. Same input, so the bytes have to match.
+  const options = mergeOptions(undefined);
+  const decoded = frames.map((f) => realGifenc.decodePng(f.data));
+  const targetWidth = Math.min(20, decoded[0].width);
+  const sized = decoded.map((f) => (f.width === targetWidth ? f : realGifenc.resizeRgba(f, targetWidth)));
+  const width = sized[0].width;
+  const height = sized[0].height;
+  const kept = sized.map((frame, i) => ({ frame, events: frames[i].events || [], scale: targetWidth / decoded[i].width }));
+  const drawn = kept.map((entry, i) => {
+    const ops = overlayOps({
+      width, height, events: entry.events, index: i, total: kept.length,
+      options, scale: entry.scale, measure: realGifenc.textSize,
+    });
+    return ops.length ? realGifenc.drawOverlays(entry.frame, ops) || entry.frame : entry.frame;
+  });
+  const q = realGifenc.quantize(drawn, paletteSize(options.quality), { dither: ditherFor(options.quality) });
+  const expected = realGifenc.encodeGif({
+    frames: q.indexed,
+    palette: q.palette,
+    width,
+    height,
+    delayMs: frameDelay(frames, DEFAULTS.intervalMs),
+    loop: 0,
+  });
+  assert.equal(width, 20, 'the fixture really was downscaled');
+  assert.deepEqual(Buffer.from(written), Buffer.from(expected));
+});
+
+test('the downscaled strip is dropped before the encoder allocates', async () => {
+  // 120 frames of 800x500 RGBA is ~190 MB; LZW encoding is the slowest step,
+  // so the strip has to be collectable before it starts, not after it returns.
+  let sawAtQuantize = -1;
+  let sawAtEncode = -1;
+  let strip = null;
+  const enc = fakeGifenc({
+    quantize(frames, maxColors, opts) {
+      strip = frames;
+      sawAtQuantize = frames.length;
+      enc.calls.quantize.push({ frames, maxColors, opts });
+      return { palette: [0, 0, 0, 255, 255, 255], indexed: frames.map(() => new Uint8Array(4)) };
+    },
+    encodeGif(spec) {
+      sawAtEncode = strip ? strip.length : -1;
+      enc.calls.encodeGif.push(spec);
+      return Buffer.alloc(2048, 7);
+    },
+  });
+  const { recorder, session, clock } = setup({ gifenc: enc });
+  await record(recorder, session, clock, 2);
+
+  const out = await recorder.run(session, { action: 'export', tabId: 1, download: true });
+  assert.match(out, /Exported 4 frame\(s\)/);
+  assert.equal(sawAtQuantize, 4, 'the quantizer still sees every frame');
+  assert.equal(sawAtEncode, 0, 'the RGBA frames are released before encoding starts');
+});
+
+test('a decode failure names its own frame, not the first one', async () => {
+  // The three passes became one indexed loop, so the frame number in the error
+  // is now arithmetic rather than a map callback's index.
+  let seen = 0;
+  const enc = fakeGifenc({
+    decodePng(buf) {
+      enc.calls.decodePng.push(buf);
+      if (++seen === 3) throw new Error('PNG: truncated IDAT');
+      return { width: 1600, height: 1000, data: buf };
+    },
+  });
+  const { recorder, session, clock } = setup({ gifenc: enc });
+  await record(recorder, session, clock, 2);
+
+  await assert.rejects(
+    () => recorder.run(session, { action: 'export', tabId: 1, download: true }),
+    /^Error: Frame 3 of tab 1 could not be decoded: PNG: truncated IDAT$/
+  );
+  assert.equal(enc.calls.decodePng.length, 3, 'the export stops at the bad frame');
+  assert.equal(enc.calls.quantize.length, 0);
+  assert.equal(recorder.stateFor(1).frames.length, 4, 'a failed export keeps the frames');
+});

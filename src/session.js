@@ -10,6 +10,7 @@ const { BidiConnection } = require('./bidi');
 const launcher = require('./launcher');
 
 const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
+const REF_BLOCK = 10000; // ref ids each document may mint before the next block
 const EVENTS = [
   'browsingContext.load',
   'browsingContext.contextCreated',
@@ -26,9 +27,12 @@ const NO_TAB = (tabId) => `Tab ${tabId} no longer exists. Call tabs_context_mcp 
 const NO_REF = (ref) => `Element ${ref} was not found on the page. Call read_page or find again to get fresh refs.`;
 
 // Installed in the page realm; refs live here so the DOM is never mutated.
-const REF_STORE_FN = `(function () {
+const REF_STORE_FN = `(function (seed) {
+  var base = seed > 0 ? seed : 1;
   if (!window.__ffuse) {
-    window.__ffuse = { refs: new Map(), next: 1, clicks: [] };
+    window.__ffuse = { refs: new Map(), next: base, clicks: [] };
+  } else if (window.__ffuse.next < base) {
+    window.__ffuse.next = base;
   }
   return window.__ffuse.next;
 })`;
@@ -196,6 +200,10 @@ class Session {
     this._sized = new Set();
     this._booted = new Set();
     this._viewports = new Map(); // context -> {width, height}
+    // Ref ids are handed out in per-document blocks. A document that reloads
+    // starts a new block, so a ref the model still holds cannot silently
+    // resolve to a different element on the new page.
+    this._refSeed = 1;
     this._prompts = new Map(); // context -> userPromptOpened params
     if (opts.tabIds) this.tabs.seed(opts.tabIds);
 
@@ -481,7 +489,9 @@ class Session {
   async ensureRefStore(tabId) {
     const context = this.requireContext(tabId);
     if (this._booted.has(context)) return;
-    await this.callFunction(tabId, REF_STORE_FN, []);
+    const seed = this._refSeed;
+    this._refSeed += REF_BLOCK;
+    await this.callFunction(tabId, REF_STORE_FN, [seed]);
     this._booted.add(context);
   }
 
@@ -558,6 +568,6 @@ class Session {
 module.exports = {
   Session, TabRegistry, ImageStore,
   toLocalValue, fromRemoteValue,
-  DEFAULT_VIEWPORT, REF_STORE_FN, RESOLVE_REF_FN, NODE_FOR_REF_FN,
+  DEFAULT_VIEWPORT, REF_BLOCK, REF_STORE_FN, RESOLVE_REF_FN, NODE_FOR_REF_FN,
   NO_TAB, NO_REF, sleep,
 };

@@ -39,3 +39,14 @@ pairing), `shortcuts_list`, `shortcuts_execute` (Claude-in-Chrome side panel).
 - Coordinates are screenshot pixels of the tab viewport.
 - `key` takes space-separated keys ("Backspace Backspace Delete") and chords ("cmd+a").
 - Dialogs block the page: avoid triggering them; `javascript_tool` can clear them.
+
+## Deliberate deviations
+
+| Behaviour | Chrome | Here | Why |
+|---|---|---|---|
+| Tab group membership | Only tabs the extension created | Tabs we created, tabs opened by one of ours (target=_blank, window.open, OAuth popups), and whatever was already open in the automation profile | The profile at `~/.firefox-use/profile` is dedicated to automation, so a leftover tab there is ours, not the user's browsing. Tabs the user opens in another window still stay out. |
+| Element refs | Extension-side handles, stale refs error | `ref_N` minted in per-document blocks of 10000 | Same contract - a ref from a previous document is simply absent, so it errors instead of resolving to a different element. |
+| Blocking dialogs | End the automation session | `firefox_dialog` accepts or dismisses them, and pointer actions fail fast while one is open | BiDi can answer prompts; there is no reason to inherit the limitation. |
+| Per-site permission | The extension prompts per site | None; access is whatever the automation profile is logged into | There is no extension UI to prompt from. `firefox-use stop` is the off switch. |
+| `file_upload` sandbox | Files the user shared with the session | Files under the download directory, the server's working directory, or a root listed in `FIREFOX_USE_UPLOAD_ROOTS` | Claude Code has no session file-sharing concept here, so the gate is explicit instead of implied. |
+| Extra tools | - | `firefox_status`, `firefox_restart`, `firefox_dialog` | Managing a browser we launch ourselves. |

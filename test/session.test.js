@@ -278,3 +278,22 @@ test('a prompt on another tab is not consumed by the wrong answer', async () => 
   assert.equal(handled, null, 'tab 1 had no dialog of its own');
   assert.equal(session.promptTabId(), 2, "tab 2's dialog is still open");
 });
+
+test('a reloaded document mints refs from a fresh block, so stale refs miss', async () => {
+  const seeds = [];
+  const { session, conn } = sessionWith({
+    'script.callFunction': (params) => {
+      if (String(params.functionDeclaration).includes('__ffuse = { refs')) {
+        seeds.push(params.arguments[0].value);
+      }
+      return { type: 'success', result: { type: 'number', value: 1 } };
+    },
+  });
+  await session.adoptExistingTabs();
+  await session.ensureRefStore(1);
+  await session.ensureRefStore(1); // same document: no reinstall
+  conn.emit('browsingContext.load', { context: 'ctx-a' }); // navigation wipes the store
+  await session.ensureRefStore(1);
+  assert.equal(seeds.length, 2, 'installed once per document');
+  assert.ok(seeds[1] > seeds[0] + 1000, `the new document starts well past the old ids (${seeds.join(' -> ')})`);
+});

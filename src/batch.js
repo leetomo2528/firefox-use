@@ -192,7 +192,10 @@ async function batch(ctx, args = {}) {
   for (const item of items) {
     let result;
     try {
-      result = await ctx.callTool(item.name, item.input);
+      // Page tools require an explicit tabId inside a batch (the Chrome spec
+      // says so): without this stamp, an item that forgot tabId would silently
+      // act on the group's first tab instead of the one the batch just made.
+      result = await ctx.callTool(item.name, { ...item.input, __inBatch: true });
     } catch (err) {
       return failure(content, items, item, (err && err.message) || String(err));
     }

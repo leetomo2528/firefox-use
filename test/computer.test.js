@@ -10,7 +10,7 @@ const {
   computer, tools, TOOL,
   parseModifiers, isZoomShortcut, keyActions, splitChord,
   readRegion, readRepeat, readScrollAmount, readDuration, readCoordinate,
-  CLICK_LOG_FN, MAX_CLICK_LOG,
+  CLICK_LOG_FN, MAX_CLICK_LOG, INPUT_TIMEOUT, RELEASE_TIMEOUT,
 } = require('../src/computer');
 
 const META = '\uE03D';
@@ -21,7 +21,26 @@ const DELETE = '\uE017';
 const ARROW_DOWN = '\uE015';
 
 const run = (session, args, ctx) => computer(session, { tabId: 1, ...args }, ctx);
-const lastActions = (session) => session.callsOf('performActions').at(-1).args.actions;
+// Input goes out as a raw BiDi command so it can carry its own short timeout.
+const inputCalls = (session) => session.callsOf('send').filter((c) => c.args.method === 'input.performActions');
+const releaseCalls = (session) => session.callsOf('send').filter((c) => c.args.method === 'input.releaseActions');
+const lastActions = (session) => inputCalls(session).at(-1).args.params.actions;
+
+// Make input.performActions fail the way a stuck tab does, keeping the record.
+function failInput(session, message) {
+  const send = Object.getPrototypeOf(session).send;
+  session.send = async function (method, params, opts) {
+    const res = await send.call(this, method, params, opts);
+    if (method === 'input.performActions') throw new Error(message);
+    return res;
+  };
+}
+
+// A ref that resolved to a display:none element: a box of zeros at the origin.
+const HIDDEN_REF = {
+  found: true, visible: false, x: 0, y: 0, left: 0, top: 0,
+  width: 0, height: 0, inViewport: true, tag: 'button',
+};
 
 test('the tool definition is the Chrome spec verbatim', () => {
   const spec = require('../docs/chrome-tool-spec.json').find((t) => t.name === 'computer');
@@ -128,7 +147,7 @@ test('bad coordinates are rejected before anything is sent to the page', async (
   await assert.rejects(() => run(session, { action: 'left_click', coordinate: [5] }), /coordinate must be \[x, y\]/);
   await assert.rejects(() => run(session, { action: 'left_click', coordinate: ['a', 2] }), /coordinate must be \[x, y\]/);
   await assert.rejects(() => run(session, { action: 'left_click', coordinate: [5, -2] }), /is outside the viewport/);
-  assert.equal(session.callsOf('performActions').length, 0);
+  assert.equal(inputCalls(session).length, 0);
   assert.deepStrictEqual(readCoordinate([10.4, 20.6]), { x: 10, y: 21 });
 });
 
@@ -223,14 +242,36 @@ test('type sends a key source and turns newlines into Enter', async () => {
   await assert.rejects(() => run(session, { action: 'type', text: '' }), /the type action needs text to type\./);
 });
 
-test('type clicks first when given a target, so the text lands in that field', async () => {
+test('type clicks first for a ref, so the text lands in that field', async () => {
   const session = new FakeSession();
-  const text = await run(session, { action: 'type', text: 'ab', coordinate: [30, 40] });
-  const calls = session.callsOf('performActions');
+  const text = await run(session, { action: 'type', text: 'ab', ref: 'ref_7' });
+  const calls = inputCalls(session);
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].args.actions[0].type, 'pointer');
-  assert.equal(calls[1].args.actions[0].type, 'key');
-  assert.equal(text, 'Typed 2 characters after clicking (30, 40).');
+  assert.equal(calls[0].args.params.actions[0].type, 'pointer');
+  assert.equal(calls[1].args.params.actions[0].type, 'key');
+  assert.equal(text, 'Typed 2 characters after clicking ref_7 at (100, 200).');
+});
+
+test('type ignores a coordinate instead of clicking wherever the last call pointed', async () => {
+  const session = new FakeSession();
+  // Chrome's type has no target: a coordinate carried over from the previous
+  // call used to fire a click here, closing menus and moving focus.
+  const text = await run(session, { action: 'type', text: 'ab', coordinate: [30, 40] });
+  const calls = inputCalls(session);
+  assert.equal(calls.length, 1, 'no click, just the keystrokes');
+  assert.equal(calls[0].args.params.actions[0].type, 'key');
+  assert.equal(session.callsOf('callFunction').length, 0, 'nothing logged as a click either');
+  assert.equal(
+    text,
+    'Typed 2 characters. The coordinate was ignored: type goes to whatever has keyboard focus,'
+    + ' so click or hover it first, or pass ref, to move focus.'
+  );
+
+  // A ref still wins, and the ignored coordinate is called out alongside it.
+  const both = await run(session, { action: 'type', text: 'x', ref: 'ref_2', coordinate: [30, 40] });
+  assert.match(both, /^Typed 1 character after clicking ref_2 at \(100, 200\)\./);
+  assert.match(both, /The coordinate was ignored/);
+  assert.equal(inputCalls(session).at(-2).args.params.actions[0].type, 'pointer', 'the ref was clicked');
 });
 
 test('key parses space-separated keys and chords, and repeats the whole sequence', async () => {
@@ -271,7 +312,7 @@ test('key rejects a bad repeat, empty text and unknown keys', async () => {
   assert.equal(readRepeat(undefined), 1);
   await assert.rejects(() => run(session, { action: 'key', text: '   ' }), /the key action needs text/);
   await assert.rejects(() => run(session, { action: 'key', text: 'cmd+nope' }), /cannot press "cmd\+nope": unknown key: nope/);
-  assert.equal(session.callsOf('performActions').length, 0);
+  assert.equal(inputCalls(session).length, 0);
 });
 
 test('page zoom shortcuts are refused and point at the zoom action', async () => {
@@ -312,23 +353,23 @@ test('a "+" in a chord is a key, and a chord that names none is refused', async 
   );
   assert.equal(isZoomShortcut('cmd+'), false, 'a dangling + is malformed, not a zoom shortcut');
   await assert.rejects(() => run(session, { action: 'key', text: 'nope++' }), /cannot press "nope\+\+": not a modifier: nope/);
-  assert.equal(session.callsOf('performActions').length, 1, 'nothing sent for the refused chords');
+  assert.equal(inputCalls(session).length, 1, 'nothing sent for the refused chords');
 });
 
 test('a failed action releases the input state before the error is reported', async () => {
   const session = new FakeSession();
-  session.performActions = async () => { throw new Error('move target out of bounds'); };
+  failInput(session, 'move target out of bounds');
   await assert.rejects(
     () => run(session, { action: 'left_click', coordinate: [5000, 5000], modifiers: 'cmd' }),
     /move target out of bounds/
   );
-  const released = session.callsOf('send').filter((c) => c.args.method === 'input.releaseActions');
+  const released = releaseCalls(session);
   assert.equal(released.length, 1, 'cmd must not stay held down for the next action');
   assert.deepStrictEqual(released[0].args.params, { context: 'ctx-1' });
 
   // A release that fails too must not mask the original error.
   session.send = async () => { throw new Error('tab is gone'); };
-  await assert.rejects(() => run(session, { action: 'key', text: 'Enter' }), /move target out of bounds/);
+  await assert.rejects(() => run(session, { action: 'key', text: 'Enter' }), /tab is gone/);
 });
 
 test('wait validates the duration and reports what it waited', async () => {
@@ -468,5 +509,202 @@ test('the handler resolves the session from ctx and runs the action', async () =
   const [tool] = tools(fakeCtx(session));
   const text = await tool.handler({ action: 'left_click', coordinate: [2, 3], tabId: 1 });
   assert.equal(text, 'Clicked (2, 3).');
-  assert.equal(session.callsOf('performActions').length, 1);
+  assert.equal(inputCalls(session).length, 1);
+});
+
+test('a ref that is not visible is refused instead of clicking the origin', async () => {
+  // read_page's default filter lists non-visible elements, so the model reaches
+  // these refs routinely. getBoundingClientRect is all zeros for them, which
+  // used to aim every pointer action at (0, 0) - the site logo - and report a
+  // hit on the ref.
+  for (const action of ['left_click', 'right_click', 'double_click', 'triple_click', 'hover', 'left_click_drag', 'scroll']) {
+    const session = new FakeSession({ responses: { resolveRef: [HIDDEN_REF] } });
+    await assert.rejects(
+      () => run(session, { action, ref: 'ref_42', scroll_direction: 'down' }),
+      (err) => {
+        assert.match(err.message, /^ref_42 is on the page but not visible/, action);
+        assert.match(err.message, /read_page/, action);
+        return true;
+      },
+      action
+    );
+    assert.equal(inputCalls(session).length, 0, `${action} must not fire at the origin`);
+  }
+
+  // The implicit focus click of `type` goes through the same check, so nothing
+  // is clicked and nothing is typed.
+  const typing = new FakeSession({ responses: { resolveRef: [HIDDEN_REF] } });
+  await assert.rejects(() => run(typing, { action: 'type', text: 'hi', ref: 'ref_42' }), /not visible/);
+  assert.equal(inputCalls(typing).length, 0);
+
+  // A zero-sized box is unusable even when the page did not say so outright.
+  const zero = new FakeSession({ responses: { resolveRef: [{ found: true, x: 0, y: 0, width: 0, height: 0, tag: 'div' }] } });
+  await assert.rejects(() => run(zero, { action: 'left_click', ref: 'ref_8' }), /ref_8 is on the page but not visible/);
+  assert.equal(inputCalls(zero).length, 0);
+});
+
+test('a ref whose centre lands outside the viewport is refused with the bounds named', async () => {
+  const below = new FakeSession({
+    responses: { resolveRef: [{ found: true, visible: true, x: 640, y: 1400, width: 20, height: 10, tag: 'a' }] },
+  });
+  await assert.rejects(
+    () => run(below, { action: 'left_click', ref: 'ref_5' }),
+    /^Error: ref_5 centres on \(640, 1400\), outside the 1280x800 viewport, so left_click cannot reach it/
+  );
+  assert.equal(inputCalls(below).length, 0, 'better a clear error than an opaque one from BiDi');
+
+  const above = new FakeSession({
+    responses: { resolveRef: [{ found: true, visible: true, x: 10, y: -40, width: 20, height: 10, tag: 'a' }] },
+  });
+  await assert.rejects(() => run(above, { action: 'hover', ref: 'ref_6' }), /centres on \(10, -40\), outside the 1280x800 viewport/);
+
+  // scroll_to still reports such an element: it is the action that fixes it.
+  const offscreen = new FakeSession({
+    responses: { resolveRef: [{ found: true, visible: true, x: 5, y: 900, width: 10, height: 10, tag: 'div', inViewport: false }] },
+  });
+  assert.match(await run(offscreen, { action: 'scroll_to', ref: 'ref_1' }), /still partly outside the viewport\./);
+});
+
+test('a tab blocked by a dialog fails at once and names firefox_dialog', async () => {
+  const session = new FakeSession();
+  session.blockedTabId = 1;
+  const blocked = (err) => {
+    assert.match(err.message, /Tab 1 is blocked by a dialog/);
+    assert.match(err.message, /Call firefox_dialog to accept or dismiss it/);
+    return true;
+  };
+  for (const args of [
+    { action: 'left_click', coordinate: [10, 10] },
+    { action: 'key', text: 'Enter' },
+    { action: 'type', text: 'hi' },
+    { action: 'scroll', coordinate: [1, 1], scroll_direction: 'down' },
+    { action: 'left_click', ref: 'ref_1' },
+    { action: 'scroll_to', ref: 'ref_1' },
+  ]) {
+    await assert.rejects(() => run(session, args), blocked, args.action);
+  }
+  assert.equal(inputCalls(session).length, 0, 'nothing is sent to a tab that cannot answer');
+  assert.equal(session.callsOf('resolveRef').length, 0, 'and no page script is waited on either');
+
+  // Only the blocked tab is affected.
+  const two = new FakeSession({
+    tabs: [
+      { tabId: 1, context: 'ctx-1', url: 'https://one.test/' },
+      { tabId: 2, context: 'ctx-2', url: 'https://two.test/' },
+    ],
+  });
+  two.blockedTabId = 2;
+  assert.equal(await computer(two, { action: 'left_click', coordinate: [1, 2], tabId: 1 }), 'Clicked (1, 2).');
+});
+
+test('input commands carry their own short timeout, and the release an even shorter one', async () => {
+  const session = new FakeSession();
+  await run(session, { action: 'left_click', coordinate: [1, 2] });
+  const sent = inputCalls(session).at(-1).args;
+  assert.equal(sent.params.context, 'ctx-1');
+  assert.deepStrictEqual(sent.opts, { timeout: INPUT_TIMEOUT });
+  // The BiDi default is 60s per command; a failing action used to burn two of
+  // them (the action, then the release) before the model heard anything.
+  assert.ok(INPUT_TIMEOUT <= 10000, 'a stuck tab must not hold the model for the 60s default');
+
+  failInput(session, 'BiDi command timed out: input.performActions');
+  await assert.rejects(() => run(session, { action: 'key', text: 'Enter' }), /timed out/);
+  assert.deepStrictEqual(releaseCalls(session).at(-1).args.opts, { timeout: RELEASE_TIMEOUT });
+  assert.ok(RELEASE_TIMEOUT <= INPUT_TIMEOUT, 'the recovery must not double the wait');
+});
+
+test('an action that opens a dialog itself reports it instead of a bare timeout', async () => {
+  const session = new FakeSession();
+  const send = Object.getPrototypeOf(session).send;
+  session.send = async function (method, params, opts) {
+    const res = await send.call(this, method, params, opts);
+    if (method === 'input.performActions') {
+      this.blockedTabId = 1; // the click raised a confirm(), which never answers
+      throw new Error('BiDi command timed out: input.performActions');
+    }
+    return res;
+  };
+  await assert.rejects(
+    () => run(session, { action: 'left_click', coordinate: [5, 5] }),
+    /timed out: input\.performActions\. Tab 1 is blocked by a dialog.*firefox_dialog/
+  );
+  assert.equal(releaseCalls(session).length, 1, 'the input state is still released');
+});
+
+test('screenshot labels and zoom bounds follow the viewport of the tab acted on', async () => {
+  const session = new FakeSession({
+    tabs: [
+      { tabId: 1, context: 'ctx-1', url: 'https://one.test/' },
+      { tabId: 2, context: 'ctx-2', url: 'https://two.test/' },
+    ],
+  });
+  const ctx = fakeCtx(session);
+  await session.setViewport(1, { width: 500, height: 400 }); // resize_window on tab 1 only
+
+  const one = await computer(session, { action: 'screenshot', tabId: 1 }, ctx);
+  assert.equal(one.content[1].text, 'Screenshot of https://one.test/ | viewport 500x400 | imageId img_1');
+  const stored = session.images.get('img_1');
+  assert.deepStrictEqual([stored.width, stored.height], [500, 400], 'the image store must not learn tab 2\'s size');
+
+  const two = await computer(session, { action: 'screenshot', tabId: 2 }, ctx);
+  assert.equal(two.content[1].text, 'Screenshot of https://two.test/ | viewport 1280x800 | imageId img_2');
+
+  // Zoom is validated against that tab's bounds, not the session default.
+  await assert.rejects(
+    () => computer(session, { action: 'zoom', region: [0, 0, 900, 300], tabId: 1 }, ctx),
+    /zoom region \[0, 0, 900, 300\] falls outside the 500x400 viewport\./
+  );
+  const zoomed = await computer(session, { action: 'zoom', region: [0, 0, 900, 300], tabId: 2 }, ctx);
+  assert.deepStrictEqual(session.callsOf('screenshot').at(-1).args.clip, { x: 0, y: 0, width: 900, height: 300 });
+  assert.match(zoomed.content[1].text, /900x300 px/);
+});
+
+test('a box with one zero dimension is refused too, and named for what it is', async () => {
+  // resolveRef only sets visible from width>0 && height>0, so a stub or a future
+  // resolver that omits the flag must not get a click aimed at a line with no
+  // area: the centre of a 120x0 box sits on its own top edge.
+  const flat = new FakeSession({ responses: { resolveRef: [{ found: true, x: 60, y: 300, width: 120, height: 0, tag: 'span' }] } });
+  await assert.rejects(
+    () => run(flat, { action: 'left_click', ref: 'ref_4' }),
+    /^Error: ref_4 is on the page but not visible/
+  );
+  assert.equal(inputCalls(flat).length, 0);
+});
+
+test('scroll_to does not call a zero-sized box "fully in the viewport"', async () => {
+  // inViewport is computed from a rect of zeros, so it reads true for a
+  // display:none element. Saying it landed in the viewport would send the model
+  // back to a click that now (correctly) refuses, with no idea why.
+  const session = new FakeSession({ responses: { resolveRef: [HIDDEN_REF] } });
+  const text = await run(session, { action: 'scroll_to', ref: 'ref_42' });
+  assert.doesNotMatch(text, /in the viewport/);
+  assert.match(text, /^ref_42 <button> is on the page but not visible/);
+  assert.match(text, /read_page/);
+});
+
+test('the dialog hint never masks a failure that was not an Error', async () => {
+  const session = new FakeSession();
+  const send = Object.getPrototypeOf(session).send;
+  session.send = async function (method, params, opts) {
+    const res = await send.call(this, method, params, opts);
+    if (method === 'input.performActions') {
+      this.blockedTabId = 1;
+      throw 'socket closed mid-command'; // a bare string, not an Error
+    }
+    return res;
+  };
+  await assert.rejects(
+    () => run(session, { action: 'left_click', coordinate: [5, 5] }),
+    /^Error: socket closed mid-command\. Tab 1 is blocked by a dialog/
+  );
+});
+
+test('the ignored-coordinate note fits whichever way focus was set', async () => {
+  const session = new FakeSession();
+  const alone = await run(session, { action: 'type', text: 'x', coordinate: [30, 40] });
+  assert.match(alone, /so click or hover it first, or pass ref, to move focus\.$/);
+  // Telling the model to "pass ref" when it just passed one is bad advice.
+  const withRef = await run(session, { action: 'type', text: 'x', ref: 'ref_2', coordinate: [30, 40] });
+  assert.match(withRef, /The coordinate was ignored: ref_2 is what decided where the focus went\.$/);
+  assert.doesNotMatch(withRef, /or pass ref/);
 });

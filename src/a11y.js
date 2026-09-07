@@ -14,6 +14,12 @@ const DEFAULT_DEPTH = 15;
 const FIND_DEPTH = 30;
 const FIND_LIMIT = 20;
 const NODE_CAP = 5000;
+// window.__ffuse.refs pins every element it holds, so it must not grow forever on
+// a long-lived SPA document. At NODE_CAP nodes per read this keeps four full page
+// reads resolvable and drops the oldest refs beyond that. Ids are never reused:
+// store.next only ever climbs, so an evicted ref reads as stale, not as a hit on
+// some other element.
+const REF_CAP = 20000;
 
 // Walks the DOM, registers a ref for every emitted element and returns the
 // tree as JSON. Text nodes become StaticText entries whose ref points at the
@@ -23,8 +29,38 @@ const TREE_FN = `(function (opts) {
   var filter = opts.filter === 'interactive' ? 'interactive' : 'all';
   var maxDepth = opts.depth > 0 ? Math.floor(opts.depth) : 15;
   var cap = opts.cap > 0 ? Math.floor(opts.cap) : 5000;
+  var refCap = opts.refCap > 0 ? Math.floor(opts.refCap) : ${REF_CAP};
+  // Repair a partial store rather than replacing it: session.ensureRefStore seeds
+  // next with this document's id block, and resetting it to 1 would hand out ids
+  // the model is still holding from the previous document.
   var store = window.__ffuse;
-  if (!store) { store = window.__ffuse = { refs: new Map(), next: 1, clicks: [] }; }
+  if (!store) { store = window.__ffuse = { clicks: [] }; }
+  if (!store.refs || typeof store.refs.get !== 'function') store.refs = new Map();
+  if (!(store.next > 0)) store.next = 1;
+  if (!store.clicks) store.clicks = [];
+
+  // Refs minted by this walk are the newest entries in the Map, so eviction from
+  // the front can never take one of them.
+  var minted = 0;
+  function register(el) {
+    var ref = 'ref_' + store.next++;
+    store.refs.set(ref, el);
+    minted++;
+    var over = store.refs.size - refCap;
+    var older = store.refs.size - minted;
+    if (over > older) over = older;
+    if (over > 0) {
+      var keys = store.refs.keys();
+      var doomed = [];
+      for (var d = 0; d < over; d++) {
+        var step = keys.next();
+        if (step.done) break;
+        doomed.push(step.value);
+      }
+      for (var x = 0; x < doomed.length; x++) store.refs['delete'](doomed[x]);
+    }
+    return ref;
+  }
 
   var SKIP = { script: 1, style: 1, noscript: 1, template: 1, link: 1, meta: 1, head: 1, title: 1, base: 1 };
   // Emitted as one node, never walked into: their internals (path/g/defs, canvas
@@ -198,9 +234,7 @@ const TREE_FN = `(function (opts) {
         style.visibility !== 'collapse' && Number(style.opacity) > 0.01 &&
         rect.width > 0 && rect.height > 0;
     }
-    var ref = 'ref_' + store.next++;
-    store.refs.set(ref, el);
-    var node = { ref: ref, role: role, tag: el.localName, visible: visible, children: [] };
+    var node = { ref: register(el), role: role, tag: el.localName, visible: visible, children: [] };
     if (box) node.box = box;
     var name = accName(el, role);
     if (name) node.name = name;
@@ -227,21 +261,25 @@ const TREE_FN = `(function (opts) {
     return node;
   }
 
-  // depth counts emitted levels, so with filter=interactive it does not bound the
-  // walk at all; raw is the DOM nesting guard that keeps a pathological page from
-  // overflowing the page-side stack.
+  // depth counts DOM levels descended, not levels emitted, so it bounds an
+  // interactive read the same way it bounds a full one - a button buried 20 divs
+  // deep is out of reach at depth 15 either way. Levels past the limit are still
+  // walked but nothing there is listed, so clipped is set only when something
+  // that would have been emitted was really dropped. raw is the separate DOM
+  // nesting guard that keeps a pathological page from overflowing the page-side
+  // stack.
   function visit(node, list, depth, force, raw) {
     if (count >= cap) { capped = true; return; }
     if (raw > 1000) { clipped = true; return; }
     if (node.nodeType === 3) {
-      if (filter !== 'all' || depth >= maxDepth) return;
+      if (filter !== 'all') return;
       var text = collapse(node.nodeValue);
       if (!text) return;
+      // Text the depth limit cut is a cut like any other; whitespace is not.
+      if (depth >= maxDepth) { clipped = true; return; }
       var parent = node.parentElement;
       if (!parent) return;
-      var ref = 'ref_' + store.next++;
-      store.refs.set(ref, parent);
-      list.push({ ref: ref, role: 'StaticText', tag: '#text', name: clip(text, 200), visible: true, children: [] });
+      list.push({ ref: register(parent), role: 'StaticText', tag: '#text', name: clip(text, 200), visible: true, children: [] });
       count++;
       return;
     }
@@ -249,14 +287,13 @@ const TREE_FN = `(function (opts) {
     if (SKIP[node.localName]) return;
     var keep = force || filter === 'all' || isInteractive(node);
     var childList = list;
-    var childDepth = depth;
+    var childDepth = depth + 1;
     if (keep) {
       if (depth >= maxDepth) { clipped = true; return; }
       var entry = describe(node);
       list.push(entry);
       count++;
       childList = entry.children;
-      childDepth = depth + 1;
     }
     if (NO_DESCEND[node.localName]) return;
     var shadow = node.shadowRoot;
@@ -330,11 +367,64 @@ const TEXT_FN = `(function () {
     return parts.join('');
   }
 
+  // extract's own rules, measured instead of joined. The ratio test below asks
+  // how much of the page's readable text the articles hold, and body.textContent
+  // is the wrong denominator for that: it counts text no reader ever sees, and a
+  // framework hydration blob in a <script> is routinely larger than the prose -
+  // big enough to make a whole page of articles look like a sliver of itself.
+  function readableLen(el) {
+    return extract(el).replace(/\\s+/g, ' ').trim().length;
+  }
+
+  // Text over markup, weighted by how many paragraphs the block holds. Used for
+  // both the article candidates and the div fallback so they rank alike.
+  function scoreOf(el, len) {
+    var html = el.innerHTML ? el.innerHTML.length : len;
+    var density = len / (html > 0 ? html : 1);
+    var paragraphs = el.getElementsByTagName ? el.getElementsByTagName('p').length : 0;
+    return len * (0.3 + density) * (1 + (paragraphs > 20 ? 20 : paragraphs) / 20);
+  }
+
+  // A blog index or news homepage wraps every teaser card in its own <article>,
+  // so the first one is a single card, not the page. Rank the candidates, keep
+  // the ones of comparable size, and abandon the article path when what is left
+  // is a sliver of the page - main/density will read it better.
+  function articleRoots() {
+    var nodes = document.querySelectorAll('article');
+    var cands = [];
+    for (var i = 0; i < nodes.length && i < 1000; i++) {
+      var el = nodes[i];
+      var nested = false;
+      // An article inside an article would have its text counted twice.
+      for (var p = el.parentElement; p; p = p.parentElement) {
+        if (p.localName === 'article') { nested = true; break; }
+      }
+      if (nested) continue;
+      var len = collapseLen(el);
+      if (len <= 200) continue;
+      cands.push({ el: el, len: len, score: scoreOf(el, len), order: i });
+    }
+    if (!cands.length) return null;
+    var best = cands[0];
+    for (var j = 1; j < cands.length; j++) if (cands[j].score > best.score) best = cands[j];
+    var chosen = [];
+    var total = 0;
+    for (var k = 0; k < cands.length; k++) {
+      if (cands[k] === best || cands[k].len * 2 >= best.len) { chosen.push(cands[k]); total += cands[k].len; }
+    }
+    // Measured last: a page with no article of its own never pays for it.
+    if (total * 4 < readableLen(document.body)) return null;
+    chosen.sort(function (a, b) { return a.order - b.order; });
+    var els = [];
+    for (var m = 0; m < chosen.length; m++) els.push(chosen[m].el);
+    return els;
+  }
+
   function pick() {
-    var article = document.querySelector('article');
-    if (article && collapseLen(article) > 200) return { el: article, source: 'article' };
+    var articles = articleRoots();
+    if (articles) return { els: articles, source: articles.length > 1 ? 'articles' : 'article' };
     var main = document.querySelector('main, [role=main]');
-    if (main && collapseLen(main) > 200) return { el: main, source: 'main' };
+    if (main && collapseLen(main) > 200) return { els: [main], source: 'main' };
     var nodes = document.querySelectorAll('div, section, td, article, main');
     var best = null;
     var bestScore = 0;
@@ -342,18 +432,18 @@ const TEXT_FN = `(function () {
       var el = nodes[i];
       var len = collapseLen(el);
       if (len < 300) continue;
-      var html = el.innerHTML ? el.innerHTML.length : len;
-      var density = len / (html > 0 ? html : 1);
-      var paragraphs = el.getElementsByTagName('p').length;
-      var score = len * (0.3 + density) * (1 + (paragraphs > 20 ? 20 : paragraphs) / 20);
+      var score = scoreOf(el, len);
       if (score > bestScore) { bestScore = score; best = el; }
     }
-    if (best) return { el: best, source: 'density' };
-    return { el: document.body, source: 'body' };
+    if (best) return { els: [best], source: 'density' };
+    return { els: [document.body], source: 'body' };
   }
 
-  var chosen = document.body ? pick() : { el: null, source: 'none' };
-  var raw = chosen.el ? extract(chosen.el) : '';
+  var chosen = document.body ? pick() : { els: [], source: 'none' };
+  var raw = '';
+  for (var ri = 0; ri < chosen.els.length; ri++) {
+    raw += (ri ? '\\n\\n' : '') + extract(chosen.els[ri]);
+  }
   var text = raw
     .replace(/\\r/g, '')
     .replace(/[ \\t\\f\\v\\u00a0]+/g, ' ')
@@ -618,11 +708,30 @@ function rankNodes(nodes, query) {
   return scored.map((s) => s.node);
 }
 
+// find searches the tree the page handed back, which may be a cut-down version
+// of the page. Saying "no elements matched" about a tree that stopped short is
+// the wrong answer, so every cut travels with the result.
+function searchNotes(data) {
+  const notes = [];
+  if (data && data.clipped) {
+    notes.push(`[the tree was cut at depth ${data.depth}: elements deeper than that were not searched - ` +
+      'use read_page with a larger depth, or with ref_id, to reach that part of the page]');
+  }
+  if (data && data.capped) {
+    notes.push(`[element limit reached: only the first ${data.count} elements were searched - ` +
+      'use read_page with ref_id to look at the rest of the page]');
+  }
+  return notes;
+}
+
 function formatMatches(data, query, matches) {
   const header = pageHeader(data);
+  const notes = searchNotes(data);
+  const trailer = notes.length ? `\n\n${notes.join('\n')}` : '';
   if (!matches.length) {
-    return `${header}\n\nNo elements matched "${query}". ` +
-      'Try different wording, or call read_page to see what is on the page.';
+    const where = notes.length ? ' in the part of the page that was searched' : '';
+    return `${header}\n\nNo elements matched "${query}"${where}. ` +
+      'Try different wording, or call read_page to see what is on the page.' + trailer;
   }
   const shown = matches.slice(0, FIND_LIMIT);
   const plural = matches.length === 1 ? 'match' : 'matches';
@@ -632,7 +741,7 @@ function formatMatches(data, query, matches) {
   if (matches.length > FIND_LIMIT) {
     lines.push('', `More than ${FIND_LIMIT} elements matched. Use a more specific query to narrow it down.`);
   }
-  return lines.join('\n');
+  return lines.join('\n') + trailer;
 }
 
 async function find(session, { query, tabId } = {}) {
@@ -749,7 +858,7 @@ function tools(ctx) {
 
 module.exports = {
   readPage, find, getPageText, tools,
-  renderTree, formatNodeLine, truncateAtLine, rankNodes, flattenNodes, tokenize, queryTokens,
+  renderTree, formatNodeLine, formatMatches, truncateAtLine, rankNodes, flattenNodes, tokenize, queryTokens,
   TREE_FN, TEXT_FN,
-  DEFAULT_MAX_CHARS, MAX_TEXT_CHARS, DEFAULT_DEPTH, FIND_DEPTH, FIND_LIMIT, NODE_CAP,
+  DEFAULT_MAX_CHARS, MAX_TEXT_CHARS, DEFAULT_DEPTH, FIND_DEPTH, FIND_LIMIT, NODE_CAP, REF_CAP,
 };

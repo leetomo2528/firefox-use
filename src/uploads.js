@@ -14,6 +14,7 @@ const { NO_REF } = require('./session');
 
 const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
 const DEFAULT_IMAGE_NAME = 'image.png';
+const UPLOAD_ROOTS_ENV = 'FIREFOX_USE_UPLOAD_ROOTS';
 
 // Reads back what the input actually holds, so the report is not a guess.
 const FILES_FN = `(function (ref) {
@@ -108,12 +109,64 @@ function expandHome(p) {
   return p;
 }
 
-// Every path has to be a readable regular file, and the batch has to fit the
-// documented 10 MB budget, before the page is touched at all.
-function resolvePaths(paths) {
+// The upload sandbox. The tool description promises that only files inside a
+// small set of folders can be handed to a page; this is that rule. Without it a
+// page saying "attach ~/.ssh/id_rsa" would be obeyed.
+//
+// Roots: the folder this server writes downloads to, anything the operator
+// listed in FIREFOX_USE_UPLOAD_ROOTS, and the directory the server was started
+// in (nothing here ever chdir()s, so process.cwd() is still that directory).
+function scratchDir(ctx) {
+  // Also root #1, so the scratch copy upload_image writes can never be refused
+  // by the gate that guards it.
+  return (ctx && ctx.config && ctx.config.downloadDir) || os.tmpdir();
+}
+
+function uploadRoots(ctx) {
+  const roots = [];
+  const add = (raw) => {
+    if (typeof raw !== 'string' || !raw.trim()) return;
+    const given = path.resolve(expandHome(raw.trim()));
+    let real;
+    // A root that does not exist yet is still worth naming in the error; it
+    // simply matches nothing until it is created.
+    try { real = fs.realpathSync(given); } catch { real = given; }
+    if (!roots.some((r) => r.given === given && r.real === real)) roots.push({ given, real });
+  };
+  add(scratchDir(ctx));
+  // path.delimiter is ':' where we run, and ';' on Windows - the one separator
+  // that cannot be confused with a drive letter.
+  for (const entry of String(process.env[UPLOAD_ROOTS_ENV] || '').split(path.delimiter)) add(entry);
+  add(process.cwd());
+  return roots;
+}
+
+function under(child, parent) {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+function insideRoots(target, roots) {
+  return roots.some((r) => under(target, r.given) || under(target, r.real));
+}
+
+function outsideRoots(what, roots) {
+  return new Error(
+    `${what} is outside the folders this server may upload from. `
+    + `Allowed roots: ${roots.map((r) => r.given).join(', ')}. `
+    + `To add one, start the server with ${UPLOAD_ROOTS_ENV}=/absolute/path `
+    + '(colon-separated for more than one).'
+  );
+}
+
+// Every path has to sit inside an allowed root - after symlinks are resolved -
+// and be a readable regular file, and the batch has to fit the documented 10 MB
+// budget, before the page is touched at all.
+function resolvePaths(paths, ctx) {
   if (!Array.isArray(paths) || !paths.length) {
     throw new Error('paths must be a non-empty array of absolute file paths.');
   }
+  const roots = uploadRoots(ctx);
   const files = [];
   let total = 0;
   for (const raw of paths) {
@@ -121,17 +174,42 @@ function resolvePaths(paths) {
       throw new Error('Every entry in paths must be a non-empty string.');
     }
     const abs = path.resolve(expandHome(raw.trim()));
+    let real = null;
+    let unreadable = null;
+    try {
+      real = fs.realpathSync(abs);
+    } catch (err) {
+      unreadable = err; // reported below, but only once the path is allowed
+    }
+    // The realpath decides, never the given path. Both directions matter: a
+    // symlink planted inside a root and pointing out of it is the escape this
+    // gate exists to stop, and a root reached through a symlinked ancestor
+    // (/tmp -> /private/tmp, and process.cwd() is always the resolved form) is
+    // still that root, so naming it the other way must not be refused.
+    // A path that cannot be resolved at all is judged on its literal form, so
+    // an outside path is refused with the same message either way and cannot
+    // double as an existence oracle for the model or the page.
+    if (!insideRoots(real === null ? abs : real, roots)) {
+      throw real !== null && real !== abs
+        ? outsideRoots(`${abs} resolves to ${real}, which`, roots)
+        : outsideRoots(abs, roots);
+    }
+    if (real === null) {
+      if (unreadable.code === 'ENOENT') throw new Error(`File not found: ${abs}`);
+      throw new Error(`Cannot read ${abs}: ${unreadable.message}`);
+    }
     let stat;
     try {
-      stat = fs.statSync(abs);
+      stat = fs.statSync(real);
     } catch (err) {
-      if (err.code === 'ENOENT') throw new Error(`File not found: ${abs}`);
       throw new Error(`Cannot read ${abs}: ${err.message}`);
     }
     if (stat.isDirectory()) throw new Error(`${abs} is a directory. file_upload takes files, not folders.`);
     if (!stat.isFile()) throw new Error(`${abs} is not a regular file.`);
     total += stat.size;
-    files.push({ path: abs, size: stat.size });
+    // The resolved path is the one that was checked, so it is the one the
+    // browser is handed.
+    files.push({ path: real, size: stat.size });
   }
   if (total >= MAX_TOTAL_BYTES) {
     const much = files.length === 1
@@ -193,8 +271,8 @@ function describeInput(info, expected) {
   return `The input now reports ${plural(info.count, 'file')}${names ? `: ${names}` : ''}.`;
 }
 
-async function fileUpload(session, { paths, ref, tabId } = {}) {
-  const { files, total } = resolvePaths(paths);
+async function fileUpload(session, { paths, ref, tabId } = {}, ctx = {}) {
+  const { files, total } = resolvePaths(paths, ctx);
   const tid = await targetTab(session, tabId);
   const info = await attachFiles(session, tid, ref, files.map((f) => f.path));
   const lines = [`Attached ${plural(files.length, 'file')} (${formatBytes(total)}) to ${ref} on tab ${tid}:`];
@@ -237,10 +315,17 @@ function requirePoint(coordinate) {
   return { x: Math.round(x), y: Math.round(y) };
 }
 
+// The scratch copy upload_image hands to input.setFiles passes the same gate as
+// a caller-supplied path: it is written at its resolved location inside the
+// download folder, and nowhere else.
 function writeImageFile(image, name, ctx) {
-  const dir = (ctx && ctx.config && ctx.config.downloadDir) || os.tmpdir();
+  const dir = scratchDir(ctx);
   fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, name);
+  const realDir = fs.realpathSync(dir);
+  const file = path.join(realDir, name);
+  if (path.dirname(file) !== realDir || !insideRoots(file, uploadRoots(ctx))) {
+    throw new Error(`Refusing to write ${file}: images written for an upload stay in ${realDir}.`);
+  }
   const bytes = Buffer.from(image.data, 'base64');
   fs.writeFileSync(file, bytes);
   return { path: file, size: bytes.length };
@@ -327,14 +412,14 @@ function tools(ctx) {
   return [
     {
       name: 'file_upload',
-      description: 'Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs \u2014 clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files the user has shared with this session (attachments, the session\'s outputs/uploads folders, or folders the user has connected) can be uploaded; other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.',
+      description: 'Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs \u2014 clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the folders this server may upload from can be uploaded; every other path is rejected, including a symlink that resolves out of them. Those folders are the downloads folder of this session, the directory the server was started in, and any absolute path listed in the FIREFOX_USE_UPLOAD_ROOTS environment variable; a rejection names the roots that are allowed. The combined size of all files in a single call must stay under 10 MB.',
       inputSchema: {
         type: 'object',
         properties: {
           paths: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute paths to the files to upload. Each path must be a file the user has shared with this session.',
+            description: 'Absolute paths to the files to upload. Each path must resolve inside one of the folders this server may upload from (its downloads folder, the directory it was started in, or a FIREFOX_USE_UPLOAD_ROOTS entry).',
           },
           ref: {
             type: 'string',
@@ -387,5 +472,6 @@ function tools(ctx) {
 module.exports = {
   fileUpload, uploadImage, tools,
   resolvePaths, attachFiles, requireImage, imageName, requirePoint, formatBytes,
-  FILES_FN, DROP_FN, MAX_TOTAL_BYTES,
+  uploadRoots, writeImageFile,
+  FILES_FN, DROP_FN, MAX_TOTAL_BYTES, UPLOAD_ROOTS_ENV,
 };

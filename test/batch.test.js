@@ -82,7 +82,7 @@ test('actions run one after another, never overlapping', async () => {
     'start:computer', 'end:computer',
   ]);
   assert.deepEqual(ctx.calls.map((c) => c.name), ['navigate', 'find', 'computer']);
-  assert.deepEqual(ctx.calls[0].input, { url: 'https://example.com' });
+  assert.deepEqual(ctx.calls[0].input, { url: 'https://example.com', __inBatch: true });
   assert.equal(result.isError, undefined);
   assert.deepEqual(texts(result), [
     '[1] navigate\nnavigate ok',
@@ -256,7 +256,7 @@ test('malformed items are rejected before the batch starts', async () => {
 test('a missing input is forwarded as an empty object, and a plain object result is JSON text', async () => {
   const ctx = stubCtx({ tabs_context_mcp: { tabs: [{ tabId: 1, url: 'https://example.com/' }] } });
   const result = await batch(ctx, { actions: [{ name: 'tabs_context_mcp' }] });
-  assert.deepEqual(ctx.calls, [{ name: 'tabs_context_mcp', input: {} }]);
+  assert.deepEqual(ctx.calls, [{ name: 'tabs_context_mcp', input: { __inBatch: true } }]);
   assert.equal(
     texts(result)[0],
     `[1] tabs_context_mcp\n${JSON.stringify({ tabs: [{ tabId: 1, url: 'https://example.com/' }] }, null, 2)}`
@@ -350,4 +350,33 @@ test('a structured text payload is serialized, not stringified', async () => {
   assert.equal(texts(result)[0], `[1] read_page\n${JSON.stringify({ tree: ['button "OK"'] }, null, 2)}`);
   assert.ok(!/\[object Object\]/.test(texts(result).join('\n')));
   assert.equal(resultError({ content: [{ type: 'text', text: { code: 42 } }], isError: true }), '{\n  "code": 42\n}');
+});
+
+test('page tools are told they are inside a batch', async () => {
+  const seen = [];
+  const ctx = {
+    callTool: async (name, input) => {
+      seen.push({ name, input });
+      return { content: [{ type: 'text', text: `${name} ok` }] };
+    },
+    config: {},
+  };
+  await batch(ctx, {
+    actions: [
+      { name: 'navigate', input: { url: 'https://example.com', tabId: 7 } },
+      { name: 'computer', input: { action: 'screenshot', tabId: 7 } },
+    ],
+  });
+  assert.equal(seen.length, 2);
+  for (const call of seen) {
+    assert.equal(call.input.__inBatch, true, `${call.name} must know it is in a batch`);
+  }
+  assert.equal(seen[0].input.url, 'https://example.com', 'the caller input is preserved');
+});
+
+test('the batch marker does not leak back into the caller-supplied object', async () => {
+  const input = { url: 'https://example.com', tabId: 3 };
+  const ctx = { callTool: async () => ({ content: [{ type: 'text', text: 'ok' }] }), config: {} };
+  await batch(ctx, { actions: [{ name: 'navigate', input }] });
+  assert.equal(input.__inBatch, undefined, 'the original input object is untouched');
 });

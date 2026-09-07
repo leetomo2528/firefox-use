@@ -8,19 +8,39 @@ const path = require('path');
 
 const {
   fileUpload, uploadImage, tools, resolvePaths, imageName, requirePoint,
+  uploadRoots, writeImageFile, UPLOAD_ROOTS_ENV,
   FILES_FN, DROP_FN,
 } = require('../src/uploads');
 const { FakeSession } = require('./helpers/fake-session');
 const { NO_TAB, NO_REF } = require('../src/session');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-uploads-'));
-after(() => fs.rmSync(TMP, { recursive: true, force: true }));
+// realpath'd: on macOS os.tmpdir() is a symlink, and the gate reports resolved
+// paths, so the fixtures have to be resolved too.
+const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-uploads-')));
+// Deliberately not an allowed root: the sandbox is TMP (the download dir) plus
+// the server's own working directory.
+const OUTSIDE = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-outside-')));
+after(() => {
+  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.rmSync(OUTSIDE, { recursive: true, force: true });
+});
 
 function tmpFile(name, contents = 'hello') {
   const p = path.join(TMP, name);
   fs.writeFileSync(p, contents);
   return p;
 }
+
+function outsideFile(name, contents = 'secret') {
+  const p = path.join(OUTSIDE, name);
+  fs.writeFileSync(p, contents);
+  return p;
+}
+
+// file_upload reads the upload sandbox off ctx, exactly as its handler does, so
+// every direct call in this file supplies one.
+const CTX = { config: { downloadDir: TMP } };
+const upload = (session, args, ctx = CTX) => fileUpload(session, args, ctx);
 
 // Sparse, so a 10 MB+ fixture costs nothing.
 function tmpSparse(name, size) {
@@ -36,13 +56,25 @@ function ctxFor(session, downloadDir = TMP) {
 
 const setFilesCall = (session) => session.callsOf('send').find((c) => c.args.method === 'input.setFiles');
 
+// The env var is process-wide; put it back whatever the body does.
+async function withUploadRoots(value, body) {
+  const before = process.env[UPLOAD_ROOTS_ENV];
+  process.env[UPLOAD_ROOTS_ENV] = value;
+  try {
+    return await body();
+  } finally {
+    if (before === undefined) delete process.env[UPLOAD_ROOTS_ENV];
+    else process.env[UPLOAD_ROOTS_ENV] = before;
+  }
+}
+
 // --- path validation ------------------------------------------------------
 
 test('paths must be a non-empty array of strings', async () => {
   const session = new FakeSession();
-  await assert.rejects(fileUpload(session, { paths: [], ref: 'ref_1', tabId: 1 }), /non-empty array/);
-  await assert.rejects(fileUpload(session, { ref: 'ref_1', tabId: 1 }), /non-empty array/);
-  await assert.rejects(fileUpload(session, { paths: ['  '], ref: 'ref_1', tabId: 1 }), /non-empty string/);
+  await assert.rejects(upload(session, { paths: [], ref: 'ref_1', tabId: 1 }), /non-empty array/);
+  await assert.rejects(upload(session, { ref: 'ref_1', tabId: 1 }), /non-empty array/);
+  await assert.rejects(upload(session, { paths: ['  '], ref: 'ref_1', tabId: 1 }), /non-empty string/);
   assert.equal(session.calls.length, 0, 'the page is never touched for an invalid request');
 });
 
@@ -50,7 +82,7 @@ test('a missing file is reported by absolute path, before any page work', async 
   const session = new FakeSession();
   const missing = path.join(TMP, 'nope.txt');
   await assert.rejects(
-    fileUpload(session, { paths: [missing], ref: 'ref_1', tabId: 1 }),
+    upload(session, { paths: [missing], ref: 'ref_1', tabId: 1 }),
     (err) => err.message === `File not found: ${missing}`
   );
   assert.equal(session.calls.length, 0);
@@ -59,7 +91,7 @@ test('a missing file is reported by absolute path, before any page work', async 
 test('a directory is refused instead of being handed to setFiles', async () => {
   const session = new FakeSession();
   await assert.rejects(
-    fileUpload(session, { paths: [TMP], ref: 'ref_1', tabId: 1 }),
+    upload(session, { paths: [TMP], ref: 'ref_1', tabId: 1 }),
     /is a directory\. file_upload takes files, not folders\./
   );
   assert.equal(setFilesCall(session), undefined);
@@ -67,13 +99,182 @@ test('a directory is refused instead of being handed to setFiles', async () => {
 
 test('relative and ~ paths become absolute in the setFiles payload', () => {
   const rel = path.relative(process.cwd(), tmpFile('rel.txt'));
-  const { files } = resolvePaths([rel]);
+  const { files } = resolvePaths([rel], CTX);
   assert.equal(files[0].path, path.join(TMP, 'rel.txt'));
-  assert.throws(() => resolvePaths(['~/definitely-not-here-ffuse.txt']), (err) => {
-    assert.match(err.message, /^File not found: /);
-    assert.ok(err.message.includes(os.homedir()), 'the ~ is expanded before reporting');
+  assert.throws(() => resolvePaths(['~/definitely-not-here-ffuse.txt'], CTX), (err) => {
+    assert.match(err.message, /is outside the folders this server may upload from/);
+    assert.ok(err.message.startsWith(os.homedir()), 'the ~ is expanded before reporting');
     return true;
   });
+});
+
+// --- the upload sandbox ---------------------------------------------------
+//
+// The tool description promises that only files in a known set of folders can
+// be uploaded. A page that asks for ~/.ssh/id_rsa must be refused, not obeyed.
+
+test('a path outside every allowed root is refused before the page is touched', async () => {
+  const session = new FakeSession();
+  const secret = outsideFile('id_rsa', 'PRIVATE KEY');
+  await assert.rejects(
+    upload(session, { paths: [secret], ref: 'ref_1', tabId: 1 }),
+    (err) => {
+      assert.ok(
+        err.message.startsWith(`${secret} is outside the folders this server may upload from.`),
+        err.message
+      );
+      assert.ok(err.message.includes(`Allowed roots: ${TMP}`), 'the download folder is named');
+      assert.ok(err.message.includes(process.cwd()), 'the working directory is named');
+      assert.match(err.message, /FIREFOX_USE_UPLOAD_ROOTS=\/absolute\/path/, 'says how to add one');
+      return true;
+    }
+  );
+  assert.equal(session.calls.length, 0, 'no BiDi traffic at all for a refused path');
+});
+
+test('one bad path refuses the whole batch, so nothing is attached', async () => {
+  const session = new FakeSession();
+  await assert.rejects(
+    upload(session, { paths: [tmpFile('fine.txt'), outsideFile('nope.txt')], ref: 'ref_1', tabId: 1 }),
+    /is outside the folders this server may upload from/
+  );
+  assert.equal(setFilesCall(session), undefined);
+});
+
+test('a symlink inside a root that resolves outside it is refused', async () => {
+  const session = new FakeSession();
+  const secret = outsideFile('linked-secret.txt', 'ssh key');
+  const link = path.join(TMP, 'looks-innocent.txt');
+  fs.symlinkSync(secret, link);
+  await assert.rejects(
+    upload(session, { paths: [link], ref: 'ref_1', tabId: 1 }),
+    (err) => {
+      assert.ok(
+        err.message.startsWith(`${link} resolves to ${secret}, which is outside the folders`),
+        err.message
+      );
+      return true;
+    }
+  );
+  assert.equal(setFilesCall(session), undefined, 'the link is never handed to the browser');
+});
+
+test('a symlink that stays inside a root is fine, and the target path is sent', async () => {
+  const target = tmpFile('inside-target.txt', 'ok');
+  const link = path.join(TMP, 'inside-link.txt');
+  fs.symlinkSync(target, link);
+  const session = new FakeSession();
+  await upload(session, { paths: [link], ref: 'ref_1', tabId: 1 });
+  assert.deepEqual(setFilesCall(session).args.params.files, [target]);
+});
+
+test(`${UPLOAD_ROOTS_ENV} opens extra roots, colon-separated`, async () => {
+  const allowed = outsideFile('opted-in.txt', 'x');
+  const session = new FakeSession();
+  await withUploadRoots(`${path.join(OUTSIDE, 'not-created-yet')}:${OUTSIDE}`, async () => {
+    const out = await upload(session, { paths: [allowed], ref: 'ref_1', tabId: 1 });
+    assert.deepEqual(setFilesCall(session).args.params.files, [allowed]);
+    assert.match(out, /Attached 1 file/);
+  });
+  await assert.rejects(
+    upload(new FakeSession(), { paths: [allowed], ref: 'ref_1', tabId: 1 }),
+    /is outside the folders this server may upload from/,
+    'the root is gone again once the variable is'
+  );
+});
+
+test('the directory the server was started in is a root', async () => {
+  const file = outsideFile('cwd-file.txt', 'x');
+  await assert.rejects(
+    upload(new FakeSession(), { paths: [file], ref: 'ref_1', tabId: 1 }),
+    /is outside the folders this server may upload from/
+  );
+  const here = process.cwd();
+  process.chdir(OUTSIDE);
+  try {
+    const session = new FakeSession();
+    await upload(session, { paths: [file], ref: 'ref_1', tabId: 1 });
+    assert.deepEqual(setFilesCall(session).args.params.files, [file]);
+  } finally {
+    process.chdir(here);
+  }
+});
+
+test('uploadRoots is the download folder, the env roots and the working directory', async () => {
+  await withUploadRoots(`${OUTSIDE}:  :${OUTSIDE}`, () => {
+    const roots = uploadRoots(CTX);
+    assert.deepEqual(
+      roots.map((r) => r.given),
+      [TMP, OUTSIDE, process.cwd()],
+      'blank entries and duplicates drop out; order is downloads, env, cwd'
+    );
+  });
+  assert.deepEqual(uploadRoots(CTX).map((r) => r.given), [TMP, process.cwd()]);
+});
+
+test('a symlinked root is usable by either name, and the resolved path is sent', async () => {
+  const real = fs.mkdtempSync(path.join(TMP, 'root-real-'));
+  const link = path.join(TMP, 'root-link');
+  fs.symlinkSync(real, link);
+  const ctx = { config: { downloadDir: link } };
+  const file = path.join(real, 'doc.txt');
+  fs.writeFileSync(file, 'x');
+  assert.deepEqual(uploadRoots(ctx)[0], { given: link, real });
+
+  for (const given of [file, path.join(link, 'doc.txt')]) {
+    const session = new FakeSession();
+    await upload(session, { paths: [given], ref: 'ref_1', tabId: 1 }, ctx);
+    assert.deepEqual(setFilesCall(session).args.params.files, [file], `${given} resolves to the real path`);
+  }
+});
+
+test('a root named in resolved form is still reachable through a symlinked ancestor', async () => {
+  // process.cwd() is always the resolved path, and on macOS the usual scratch
+  // parents (/tmp, /var) are symlinks - so the model is routinely handed the
+  // unresolved name of a file that really does sit inside an allowed root.
+  const real = fs.mkdtempSync(path.join(TMP, 'anc-real-'));
+  const root = path.join(real, 'root');
+  fs.mkdirSync(root);
+  const alias = path.join(TMP, 'anc-link');
+  fs.symlinkSync(real, alias); // the symlink is ABOVE the root, not the root
+  const file = path.join(root, 'doc.txt');
+  fs.writeFileSync(file, 'x');
+
+  const ctx = { config: { downloadDir: root } };
+  const session = new FakeSession();
+  await upload(session, { paths: [path.join(alias, 'root', 'doc.txt')], ref: 'ref_1', tabId: 1 }, ctx);
+  assert.deepEqual(
+    setFilesCall(session).args.params.files,
+    [file],
+    'the alias resolves into the root, so it is allowed and sent resolved'
+  );
+});
+
+test('a path outside the roots is refused the same way whether or not it exists', async () => {
+  // The refusal must not double as an existence oracle: a page that asks for
+  // ~/.ssh/id_rsa learns nothing from the answer either way.
+  const missing = path.join(OUTSIDE, 'never-created.txt');
+  const present = outsideFile('does-exist.txt', 'x');
+  const messages = [];
+  for (const p of [missing, present]) {
+    await assert.rejects(
+      upload(new FakeSession(), { paths: [p], ref: 'ref_1', tabId: 1 }),
+      (err) => { messages.push(err.message.replace(p, '<path>')); return true; }
+    );
+  }
+  assert.equal(messages[0], messages[1], 'the wording does not reveal whether the file is there');
+  assert.match(messages[0], /^<path> is outside the folders this server may upload from\./);
+});
+
+test('the sandbox is enforced through the tool handler, not only the direct call', async () => {
+  const session = new FakeSession();
+  const tool = tools({ session: async () => session, config: { downloadDir: TMP } })
+    .find((t) => t.name === 'file_upload');
+  await assert.rejects(
+    tool.handler({ paths: [outsideFile('via-handler-outside.txt')], ref: 'ref_1', tabId: 1 }),
+    /is outside the folders this server may upload from/
+  );
+  assert.equal(setFilesCall(session), undefined);
 });
 
 // --- the 10 MB budget -----------------------------------------------------
@@ -83,7 +284,7 @@ test('the combined size limit is 10 MB across all files, with the spec wording',
   const a = tmpSparse('big-a.bin', 6 * 1024 * 1024);
   const b = tmpSparse('big-b.bin', 6 * 1024 * 1024);
   await assert.rejects(
-    fileUpload(session, { paths: [a, b], ref: 'ref_1', tabId: 1 }),
+    upload(session, { paths: [a, b], ref: 'ref_1', tabId: 1 }),
     (err) => {
       assert.match(err.message, /These 2 files add up to 12\.0 MB\./);
       assert.match(err.message, /The combined size of all files in a single call must stay under 10 MB\./);
@@ -96,7 +297,7 @@ test('the combined size limit is 10 MB across all files, with the spec wording',
 test('the budget is exclusive: 10 MB exactly is refused, a byte under is not', async () => {
   const at = tmpSparse('edge-at.bin', 10 * 1024 * 1024);
   await assert.rejects(
-    fileUpload(new FakeSession(), { paths: [at], ref: 'ref_1', tabId: 1 }),
+    upload(new FakeSession(), { paths: [at], ref: 'ref_1', tabId: 1 }),
     (err) => {
       assert.equal(
         err.message,
@@ -108,7 +309,7 @@ test('the budget is exclusive: 10 MB exactly is refused, a byte under is not', a
   );
   const under = tmpSparse('edge-under.bin', 10 * 1024 * 1024 - 1);
   const session = new FakeSession({ responses: { callJson: [{ found: true, tag: 'input', count: 1, names: ['edge-under.bin'] }] } });
-  const out = await fileUpload(session, { paths: [under], ref: 'ref_1', tabId: 1 });
+  const out = await upload(session, { paths: [under], ref: 'ref_1', tabId: 1 });
   assert.match(out, /Attached 1 file \(10\.0 MB\)/);
 });
 
@@ -123,7 +324,7 @@ test('file_upload sends input.setFiles with the context, sharedId and absolute p
   });
   const a = tmpFile('a.txt', 'aaa');
   const b = tmpFile('b.txt', 'bbbb');
-  const out = await fileUpload(session, { paths: [a, b], ref: 'ref_3', tabId: 1 });
+  const out = await upload(session, { paths: [a, b], ref: 'ref_3', tabId: 1 });
 
   const call = setFilesCall(session);
   assert.deepEqual(call.args.params, {
@@ -140,14 +341,14 @@ test('file_upload sends input.setFiles with the context, sharedId and absolute p
 
 test('the readback reports a mismatch rather than claiming success', async () => {
   const session = new FakeSession({ responses: { callJson: [{ found: true, tag: 'input', count: 0, names: [] }] } });
-  const out = await fileUpload(session, { paths: [tmpFile('c.txt')], ref: 'ref_1', tabId: 1 });
+  const out = await upload(session, { paths: [tmpFile('c.txt')], ref: 'ref_1', tabId: 1 });
   assert.match(out, /Warning: the input reports 0 files, not 1\./);
 });
 
 test('a page that cannot be read back does not fail the upload', async () => {
   const session = new FakeSession();
   session.callJson = async () => { throw new Error('page script failed'); };
-  const out = await fileUpload(session, { paths: [tmpFile('d.txt')], ref: 'ref_1', tabId: 1 });
+  const out = await upload(session, { paths: [tmpFile('d.txt')], ref: 'ref_1', tabId: 1 });
   assert.match(out, /Attached 1 file/);
   assert.match(out, /could not be read back to confirm/);
   assert.ok(setFilesCall(session), 'setFiles still ran');
@@ -157,7 +358,7 @@ test('a non-file element surfaces the BiDi error with the type hint', async () =
   const session = new FakeSession();
   session.send = async () => { throw new Error('no such element: not a file input'); };
   await assert.rejects(
-    fileUpload(session, { paths: [tmpFile('e.txt')], ref: 'ref_2', tabId: 1 }),
+    upload(session, { paths: [tmpFile('e.txt')], ref: 'ref_2', tabId: 1 }),
     /Could not attach files to ref_2: no such element: not a file input\. The element must be an <input type="file">\./
   );
 });
@@ -165,12 +366,12 @@ test('a non-file element surfaces the BiDi error with the type hint', async () =
 test('a stale ref and a dead tab keep the shared Chrome wording', async () => {
   const stale = new FakeSession({ responses: { refNode: [null] } });
   await assert.rejects(
-    fileUpload(stale, { paths: [tmpFile('f.txt')], ref: 'ref_7', tabId: 1 }),
+    upload(stale, { paths: [tmpFile('f.txt')], ref: 'ref_7', tabId: 1 }),
     (err) => err.message === NO_REF('ref_7')
   );
   const gone = new FakeSession();
   await assert.rejects(
-    fileUpload(gone, { paths: [tmpFile('g.txt')], ref: 'ref_1', tabId: 42 }),
+    upload(gone, { paths: [tmpFile('g.txt')], ref: 'ref_1', tabId: 42 }),
     (err) => err.message === NO_TAB(42)
   );
 });
@@ -178,14 +379,14 @@ test('a stale ref and a dead tab keep the shared Chrome wording', async () => {
 test('file_upload without a ref says which tool produces one', async () => {
   const session = new FakeSession();
   await assert.rejects(
-    fileUpload(session, { paths: [tmpFile('h.txt')], tabId: 1 }),
+    upload(session, { paths: [tmpFile('h.txt')], tabId: 1 }),
     /ref is required: use read_page or find to locate the file input/
   );
 });
 
 test('an omitted tabId falls back to the default tab', async () => {
   const session = new FakeSession({ tabs: [{ tabId: 5, context: 'ctx-5', url: 'https://x/' }] });
-  const out = await fileUpload(session, { paths: [tmpFile('i.txt')], ref: 'ref_1' });
+  const out = await upload(session, { paths: [tmpFile('i.txt')], ref: 'ref_1' });
   assert.equal(setFilesCall(session).args.params.context, 'ctx-5');
   assert.match(out, /on tab 5:/);
 });
@@ -193,7 +394,7 @@ test('an omitted tabId falls back to the default tab', async () => {
 test('a tabId that is not a number keeps the tab wording readable', async () => {
   const session = new FakeSession();
   await assert.rejects(
-    fileUpload(session, { paths: [tmpFile('j.txt')], ref: 'ref_1', tabId: 'abc' }),
+    upload(session, { paths: [tmpFile('j.txt')], ref: 'ref_1', tabId: 'abc' }),
     (err) => err.message === NO_TAB('abc')
   );
   assert.equal(setFilesCall(session), undefined);
@@ -203,7 +404,7 @@ test('a single-file input that swallowed the extras says why', async () => {
   const session = new FakeSession({
     responses: { callJson: [{ found: true, tag: 'input', fileInput: true, multiple: false, count: 1, names: ['b.txt'] }] },
   });
-  const out = await fileUpload(session, { paths: [tmpFile('k.txt'), tmpFile('l.txt')], ref: 'ref_1', tabId: 1 });
+  const out = await upload(session, { paths: [tmpFile('k.txt'), tmpFile('l.txt')], ref: 'ref_1', tabId: 1 });
   assert.match(out, /Warning: the input reports 1 file \(b\.txt\), not 2\./);
   assert.match(out, /no multiple attribute, so it holds one file at a time/);
 });
@@ -363,6 +564,34 @@ test('coordinate has to be a pair of numbers', async () => {
   assert.deepEqual(requirePoint(['12.7', 8]), { x: 13, y: 8 });
 });
 
+test('the scratch copy is written at the resolved download folder', async () => {
+  const real = fs.mkdtempSync(path.join(TMP, 'dl-real-'));
+  const link = path.join(TMP, 'dl-link');
+  fs.symlinkSync(real, link);
+  const { session, imageId } = sessionWithImage({ callJson: [{ found: true, tag: 'input', count: 1, names: ['image.png'] }] });
+  const out = await uploadImage(session, { imageId, ref: 'ref_1', tabId: 1 }, ctxFor(session, link));
+  assert.deepEqual(
+    setFilesCall(session).args.params.files,
+    [path.join(real, 'image.png')],
+    'the page gets the resolved path - the one the gate checked'
+  );
+  assert.ok(out.includes(`Wrote ${path.join(real, 'image.png')}`));
+});
+
+test('writeImageFile refuses a name that would climb out of the download folder', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'dl-guard-'));
+  const image = { data: Buffer.from('png').toString('base64'), mimeType: 'image/png' };
+  assert.throws(
+    () => writeImageFile(image, `..${path.sep}escape.png`, { config: { downloadDir: dir } }),
+    /Refusing to write .*escape\.png: images written for an upload stay in /
+  );
+  assert.ok(!fs.existsSync(path.join(dir, '..', 'escape.png')), 'nothing was written outside the folder');
+  assert.deepEqual(writeImageFile(image, 'shot.png', { config: { downloadDir: dir } }), {
+    path: path.join(dir, 'shot.png'),
+    size: 3,
+  });
+});
+
 // --- the page-side scripts ------------------------------------------------
 
 // Runs a page script with its globals shadowed by stubs, so its real logic is
@@ -500,7 +729,19 @@ test('the page scripts stay ASCII so they survive transport as-is', () => {
 
 // --- tool definitions -----------------------------------------------------
 
-test('the tool definitions match docs/chrome-tool-spec.json verbatim', () => {
+// Descriptions are prose and may differ from Chrome's; the machine-readable
+// half of the definition may not. (parity.test.js enforces the same rule.)
+function schemaShape(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key !== 'description') out[key] = schemaShape(value);
+  }
+  return out;
+}
+
+test('the tool definitions keep the Chrome schemas verbatim', () => {
   const spec = require('../docs/chrome-tool-spec.json');
   const specTools = spec.tools || spec;
   const defs = tools(ctxFor(new FakeSession()));
@@ -508,13 +749,49 @@ test('the tool definitions match docs/chrome-tool-spec.json verbatim', () => {
   for (const def of defs) {
     const want = specTools.find((t) => t.name === def.name);
     assert.ok(want, `${def.name} is in the spec`);
-    assert.equal(def.description, want.description, `${def.name} description`);
-    assert.deepEqual(def.inputSchema, want.inputSchema, `${def.name} inputSchema`);
+    assert.deepEqual(schemaShape(def.inputSchema), schemaShape(want.inputSchema), `${def.name} inputSchema`);
     assert.equal(typeof def.handler, 'function');
     for (const required of def.inputSchema.required) {
       assert.ok(def.inputSchema.properties[required], `${def.name} requires undeclared "${required}"`);
     }
+    for (const [prop, def_] of Object.entries(want.inputSchema.properties || {})) {
+      if (!def_.description) continue;
+      const ours = def.inputSchema.properties[prop];
+      assert.ok(ours && ours.description, `${def.name}.${prop} needs a description`);
+      // file_upload.paths had to change with the sandbox; nothing else did, and
+      // schemaShape above would not notice if it silently drifted.
+      if (def.name === 'file_upload' && prop === 'paths') continue;
+      assert.equal(ours.description, def_.description, `${def.name}.${prop} description drifted`);
+    }
   }
+  // upload_image says nothing about where files come from, so it stays verbatim.
+  const img = defs.find((t) => t.name === 'upload_image');
+  assert.equal(img.description, specTools.find((t) => t.name === 'upload_image').description);
+});
+
+test('file_upload documents the sandbox it actually enforces', () => {
+  const spec = require('../docs/chrome-tool-spec.json');
+  const specTools = spec.tools || spec;
+  const want = specTools.find((t) => t.name === 'file_upload');
+  const def = tools(ctxFor(new FakeSession())).find((t) => t.name === 'file_upload');
+
+  // Chrome's promise - attachments and folders the user connected - describes a
+  // sandbox this server does not have. Claiming it would be worse than useless:
+  // the model would trust a rule nothing enforces.
+  for (const claim of [/shared with this session/, /folders the user has connected/, /outputs\/uploads/]) {
+    assert.ok(!claim.test(def.description), `description still claims ${claim}`);
+    assert.ok(!claim.test(def.inputSchema.properties.paths.description), `paths still claims ${claim}`);
+  }
+  // ... and it names the rule that is enforced, so a rejection is predictable.
+  assert.match(def.description, /FIREFOX_USE_UPLOAD_ROOTS/);
+  assert.match(def.description, /symlink/);
+  assert.match(def.inputSchema.properties.paths.description, /FIREFOX_USE_UPLOAD_ROOTS/);
+
+  // Everything either side of that one sentence is still the Chrome wording.
+  const head = want.description.slice(0, want.description.indexOf('Only files'));
+  const tail = 'The combined size of all files in a single call must stay under 10 MB.';
+  assert.ok(def.description.startsWith(head), 'the read_page / do-not-click guidance is unchanged');
+  assert.ok(def.description.endsWith(tail), 'the 10 MB budget is unchanged');
 });
 
 test('building the tools opens no browser, and the handler passes ctx through', async () => {
@@ -524,8 +801,8 @@ test('building the tools opens no browser, and the handler passes ctx through', 
   const defs = tools(ctx);
   assert.equal(opened, 0);
 
-  const upload = defs.find((t) => t.name === 'file_upload');
-  const out = await upload.handler({ paths: [tmpFile('via-handler.txt', 'x')], ref: 'ref_1', tabId: 1 });
+  const tool = defs.find((t) => t.name === 'file_upload');
+  const out = await tool.handler({ paths: [tmpFile('via-handler.txt', 'x')], ref: 'ref_1', tabId: 1 });
   assert.equal(opened, 1);
   assert.match(out, /Attached 1 file \(1 B\) to ref_1 on tab 1:/);
 });

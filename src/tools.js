@@ -54,6 +54,8 @@ class ToolHost {
   }
 
   async session() {
+    // A restart is tearing the browser down; joining it beats racing it.
+    if (this._restarting) return this._restarting;
     if (this.current && !this.current.conn.closed) return this.current;
     if (!this._opening) {
       this._opening = Session.open({ ...this.opts, images: this.images, tabIds: this.tabIds })

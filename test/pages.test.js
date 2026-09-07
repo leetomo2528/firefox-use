@@ -415,10 +415,64 @@ test('resize_window prefers browser.setClientWindowState', async () => {
   assert.deepEqual(sent[0].params, { context: 'ctx-1', viewport: null });
   assert.equal(sent[1].method, 'browser.setClientWindowState');
   assert.deepEqual(sent[1].params, { clientWindow: 'win-1', state: 'normal', width: 1024, height: 768 });
-  assert.equal(session.callsOf('setViewport').length, 0);
   assert.equal(out, 'Resized the window holding tab 1 to 1024x768 via browser.setClientWindowState. Page reports innerWidth x innerHeight = 1024x700.');
-  // screenshot coordinates follow the page, not the number we asked for
-  assert.deepEqual(session.viewportSize, { width: 1024, height: 700 });
+  // Screenshot geometry follows the page, not the number we asked for - and it
+  // is recorded on the tab that was resized, never on the session default.
+  assert.deepEqual(session.callsOf('setViewport').map((c) => c.args), [{ tabId: 1, width: 1024, height: 700 }]);
+  assert.deepEqual(session.viewportFor(1), { width: 1024, height: 700 });
+  assert.deepEqual(session.viewportSize, { width: 1280, height: 800 });
+});
+
+test('resize_window sizes the tab it was given and leaves the other tabs alone', async () => {
+  const session = sessionWith(
+    [
+      { tabId: 1, context: 'ctx-1', url: 'https://a.test/', clientWindow: 'win-1' },
+      { tabId: 2, context: 'ctx-2', url: 'https://b.test/', clientWindow: 'win-2' },
+    ],
+    { callJson: [{ width: 1024, height: 700 }] }
+  );
+  const before = session.viewportFor(1);
+  await resizeWindow(session, { width: 1024, height: 768, tabId: 2 });
+  assert.deepEqual(session.viewportFor(2), { width: 1024, height: 700 });
+  // The session default is every untouched tab's size: moving it here would
+  // silently reframe tab 1's screenshots and coordinates.
+  assert.deepEqual(session.viewportSize, { width: 1280, height: 800 });
+  assert.deepEqual(session.viewportFor(1), before);
+});
+
+test('resize_window with an unreadable page reports it and records nothing', async () => {
+  const session = sessionWith(
+    [{ tabId: 1, context: 'ctx-1', url: 'about:blank', clientWindow: 'win-1' }],
+    { callJson: () => { throw new Error('no script for about: pages'); } }
+  );
+  const out = await resizeWindow(session, { width: 900, height: 700, tabId: 1 });
+  assert.match(out, /The page did not report innerWidth\/innerHeight\.$/);
+  assert.equal(session.callsOf('setViewport').length, 0);
+  assert.deepEqual(session.viewportSize, { width: 1280, height: 800 });
+});
+
+test('a re-pin the tab refuses still reports the resize that happened', async () => {
+  // The window resize already succeeded; a context that is busy navigating can
+  // reject the viewport call that records the new size, and that must not turn
+  // a completed resize into an error.
+  class StubbornViewport extends FakeSession {
+    async setViewport(tabId, size) {
+      this._record('setViewport', { tabId, ...size });
+      throw new Error('browsing context is navigating');
+    }
+  }
+  const session = new StubbornViewport({
+    tabs: [{ tabId: 1, context: 'ctx-1', url: 'https://a.test/', clientWindow: 'win-1' }],
+    responses: { callJson: [{ width: 1024, height: 700 }] },
+  });
+  const out = await resizeWindow(session, { width: 1024, height: 768, tabId: 1, __inBatch: true });
+  assert.equal(out, 'Resized the window holding tab 1 to 1024x768 via browser.setClientWindowState. Page reports innerWidth x innerHeight = 1024x700.');
+  assert.deepEqual(session.callsOf('setViewport').map((c) => c.args), [{ tabId: 1, width: 1024, height: 700 }]);
+  // Nothing global moved on the way out, and the tab keeps the size the
+  // session already had for it - a refused record leaves a stale one, never a
+  // wrong one on some other tab.
+  assert.deepEqual(session.viewportSize, { width: 1280, height: 800 });
+  assert.deepEqual(session.viewportFor(1), { width: 1280, height: 800 });
 });
 
 test('resize_window falls back to the viewport when the browser refuses', async () => {
@@ -432,6 +486,8 @@ test('resize_window falls back to the viewport when the browser refuses', async 
   const out = await resizeWindow(session, { width: 800, height: 600, tabId: 1 });
   assert.deepEqual(session.callsOf('setViewport')[0].args, { tabId: 1, width: 800, height: 600 });
   assert.equal(out, 'Resized tab 1 to 800x600 via the tab viewport (browser.setClientWindowState was rejected: unsupported operation: setClientWindowState). Page reports innerWidth x innerHeight = 800x600.');
+  assert.deepEqual(session.viewportFor(1), { width: 800, height: 600 });
+  assert.deepEqual(session.viewportSize, { width: 1280, height: 800 });
 });
 
 test('resize_window without a client window goes straight to the viewport', async () => {
@@ -682,4 +738,103 @@ test('a textarea and a number input round-trip through the native setter', () =>
   const number = runFormInput(new FakeInput({ type: 'number', id: 'age' }), 42);
   assert.equal(number.value, '42');
   assert.equal(number.describe, '<input type="number" id="age">');
+});
+
+
+// --- browser_batch handshake ----------------------------------------------
+//
+// src/batch.js stamps `__inBatch: true` onto each item's input. The spec makes
+// a tab implicit only for a standalone call, so inside a batch a page tool that
+// guesses drives the tab that existed BEFORE the batch created its own.
+
+test('navigate inside a batch refuses to guess a tab', async () => {
+  const session = sessionWith([
+    { tabId: 1, context: 'ctx-1', url: 'https://old.test/' },
+    { tabId: 2, context: 'ctx-2', url: 'about:blank' },
+  ]);
+  await assert.rejects(
+    () => navigate(session, { url: 'https://new.test/', __inBatch: true }),
+    /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/
+  );
+  // Nothing was driven: the old tab is still showing the url it had.
+  assert.equal(session.callsOf('navigate').length, 0);
+  assert.equal(session.tabs[0].url, 'https://old.test/');
+});
+
+test('navigate inside a batch runs normally once it is given a tabId', async () => {
+  const session = sessionWith(
+    [
+      { tabId: 1, context: 'ctx-1', url: 'https://old.test/' },
+      { tabId: 2, context: 'ctx-2', url: 'about:blank' },
+    ],
+    { callJson: [{ url: 'https://new.test/', title: 'New' }] }
+  );
+  const out = await navigate(session, { url: 'https://new.test/', tabId: 2, __inBatch: true });
+  // The private flag drives the tabId rule and nothing else: it reaches
+  // neither the session call nor the page.
+  assert.deepEqual(session.callsOf('navigate')[0].args, { tabId: 2, url: 'https://new.test/', wait: 'complete' });
+  assert.equal(out, 'Navigated tab 2 to https://new.test/ - "New"');
+  assert.equal(session.tabs[0].url, 'https://old.test/');
+});
+
+test('a standalone navigate still falls back to the first tab and lists the group', async () => {
+  const session = sessionWith(
+    [{ tabId: 1, context: 'ctx-1', url: 'about:blank' }],
+    { callJson: [{ url: 'https://new.test/', title: 'New' }, { url: 'https://new.test/', title: 'New', focused: true }] }
+  );
+  const out = await navigate(session, { url: 'https://new.test/' });
+  assert.equal(session.callsOf('navigate')[0].args.tabId, 1);
+  assert.match(out, /^Navigated tab 1 to https:\/\/new\.test\/ - "New"\n\nTab group: 1 tab\./);
+});
+
+test('back and forward keep their own message inside a batch', async () => {
+  const session = sessionWith([{ tabId: 1, context: 'ctx-1', url: 'https://a.test/two' }]);
+  await assert.rejects(
+    () => navigate(session, { url: 'back', __inBatch: true }),
+    /tabId is required for url:"back"\/"forward"/
+  );
+  assert.equal(session.callsOf('send').length, 0);
+});
+
+test('the other page tools refuse to guess a tab inside a batch too', async () => {
+  const tabs = [{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }];
+  const spec_ = /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/;
+
+  const js = sessionWith(tabs);
+  await assert.rejects(() => javascriptTool(js, { action: 'javascript_exec', text: '1 + 1', __inBatch: true }), spec_);
+  assert.equal(js.callsOf('evaluate').length, 0);
+
+  const form = sessionWith(tabs);
+  await assert.rejects(() => formInput(form, { ref: 'ref_1', value: 'x', __inBatch: true }), spec_);
+  assert.equal(form.callsOf('callJson').length, 0);
+
+  const win = sessionWith(tabs);
+  await assert.rejects(() => resizeWindow(win, { width: 800, height: 600, __inBatch: true }), spec_);
+  assert.equal(win.callsOf('send').length, 0);
+  assert.equal(win.callsOf('setViewport').length, 0);
+});
+
+test('the flag never reaches the page or the tool arguments', async () => {
+  const form = sessionWith(
+    [{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }],
+    { callJson: [{ found: true, ok: true, kind: 'text', describe: '<input>', value: 'x' }] }
+  );
+  await formInput(form, { ref: 'ref_1', value: 'x', tabId: 1, __inBatch: true });
+  assert.deepEqual(form.callsOf('callJson')[0].args.args, ['ref_1', 'x']);
+
+  const js = new ScriptSession(() => 2, { tabs: [{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }] });
+  await javascriptTool(js, { action: 'javascript_exec', text: '1 + 1', tabId: 1, __inBatch: true });
+  assert.deepEqual(js.sources, ['1 + 1']);
+});
+
+test('the batch runner reaches the same rule through the tool handler', async () => {
+  const session = sessionWith([{ tabId: 1, context: 'ctx-1', url: 'https://old.test/' }]);
+  const ctx = fakeCtx(session);
+  // Exactly what src/batch.js does: ctx.callTool(name, {...input, __inBatch:true}).
+  const def = tools(ctx).find((d) => d.name === 'navigate');
+  await assert.rejects(
+    () => def.handler({ url: 'https://new.test/', __inBatch: true }),
+    /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/
+  );
+  assert.equal(session.callsOf('navigate').length, 0);
 });

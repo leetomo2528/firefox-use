@@ -4,6 +4,12 @@
 // This is where a task starts: tabs_context_mcp hands out the numeric tab ids
 // every other tool takes, navigate drives the page, javascript_tool runs code
 // with REPL semantics and form_input sets a field by ref.
+//
+// browser_batch handshake: src/batch.js copies `__inBatch: true` into the input
+// of every item it runs. It is a private flag - no inputSchema declares it, the
+// handlers below drop it by destructuring, and it never reaches the page. All
+// it does is switch off the "an omitted tabId means the group's first tab"
+// fallback, which the spec allows for a standalone call and forbids in a batch.
 
 const { NO_TAB, NO_REF, sleep } = require('./session');
 
@@ -157,8 +163,25 @@ function truncate(text, limit) {
   return str.length <= limit ? str : `${str.slice(0, limit)}...`;
 }
 
+function missingTabId(tabId) {
+  return tabId === undefined || tabId === null || tabId === '';
+}
+
+// Inside browser_batch a tool that acts on a page may not guess its tab: a
+// batch of [tabs_create_mcp, navigate, computer{tabId:new}] would otherwise
+// drive the tab that existed before the batch and screenshot the wrong page.
+// The caller is src/batch.js, through the `__inBatch` flag described above.
+function requireExplicitTab(tool, tabId, inBatch) {
+  if (!inBatch || !missingTabId(tabId)) return;
+  throw new Error(
+    `${tool}: tabId is required here. Inside browser_batch, navigate (and other tools that act on a `
+    + 'page) requires an explicit tabId. Call tabs_context_mcp, or use the tabId that tabs_create_mcp '
+    + 'reported, and pass it to every item in the batch.'
+  );
+}
+
 async function resolveTab(session, tabId) {
-  if (tabId === undefined || tabId === null || tabId === '') {
+  if (missingTabId(tabId)) {
     return session.defaultTabId({ createIfEmpty: true });
   }
   const id = Number(tabId);
@@ -209,13 +232,13 @@ function normalizeUrl(raw) {
   return `https://${url}`;
 }
 
-async function navigate(session, { url, tabId } = {}) {
+async function navigate(session, { url, tabId, __inBatch: inBatch = false } = {}) {
   const raw = typeof url === 'string' ? url.trim() : '';
   if (!raw) throw new Error('navigate: url is required (a URL, or "back"/"forward").');
 
   const direction = raw.toLowerCase();
   if (direction === 'back' || direction === 'forward') {
-    if (tabId === undefined || tabId === null || tabId === '') {
+    if (missingTabId(tabId)) {
       throw new Error('navigate: tabId is required for url:"back"/"forward". Call tabs_context_mcp to get valid tab ids.');
     }
     const id = await resolveTab(session, tabId);
@@ -230,11 +253,13 @@ async function navigate(session, { url, tabId } = {}) {
     return `Went ${direction} in tab ${id}. Now at ${describePage(info, before)}`;
   }
 
+  requireExplicitTab('navigate', tabId, inBatch);
+
   const target = normalizeUrl(raw);
   let id;
   let standalone = false;
   let created = false;
-  if (tabId === undefined || tabId === null || tabId === '') {
+  if (missingTabId(tabId)) {
     // Standalone call: the spec says to run tabs_context_mcp{createIfEmpty:true}
     // for the model and hand back its listing along with the result.
     const group = await openGroup(session, true);
@@ -312,7 +337,7 @@ async function tabsCreate(session) {
 }
 
 async function tabsClose(session, { tabId } = {}) {
-  if (tabId === undefined || tabId === null || tabId === '') {
+  if (missingTabId(tabId)) {
     throw new Error('tabs_close_mcp: tabId is required. Call tabs_context_mcp to get valid tab ids.');
   }
   const id = Number(tabId);
@@ -479,13 +504,14 @@ async function runScript(session, tabId, source) {
   }
 }
 
-async function javascriptTool(session, { action, text, tabId } = {}) {
+async function javascriptTool(session, { action, text, tabId, __inBatch: inBatch = false } = {}) {
   if (action !== 'javascript_exec') {
     throw new Error(`javascript_tool: action must be "javascript_exec"${action ? `, got "${action}"` : ''}.`);
   }
   if (typeof text !== 'string' || !text.trim()) {
     throw new Error('javascript_tool: text is required (the JavaScript to run).');
   }
+  requireExplicitTab('javascript_tool', tabId, inBatch);
   const id = await resolveTab(session, tabId);
   const { topAwait } = scanSource(text);
 
@@ -519,12 +545,13 @@ async function clientWindowFor(session, tabId) {
   }
 }
 
-async function resizeWindow(session, { width, height, tabId } = {}) {
+async function resizeWindow(session, { width, height, tabId, __inBatch: inBatch = false } = {}) {
   const w = Math.round(Number(width));
   const h = Math.round(Number(height));
   if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
     throw new Error('resize_window: width and height must be positive numbers.');
   }
+  requireExplicitTab('resize_window', tabId, inBatch);
   const id = await resolveTab(session, tabId);
 
   const clientWindow = await clientWindowFor(session, id);
@@ -555,10 +582,16 @@ async function resizeWindow(session, { width, height, tabId } = {}) {
   }
 
   const info = await pageInfo(session, id);
-  // Screenshot coordinates come from session.viewportSize; keep it honest when
-  // the window path left the page a different size than it asked for.
+  // Screenshot geometry comes from session.viewportFor(tabId), and releasing
+  // the override above left this tab's record holding the size it had before
+  // the resize. Pin this tab - and only this tab - at the size the page now
+  // reports, so it reads back true while every other tab keeps rendering at the
+  // size it already had. session.viewportSize is the session default: writing
+  // to it would silently move every tab that this call never touched.
   if (how === 'window' && info.width > 0 && info.height > 0) {
-    session.viewportSize = { width: info.width, height: info.height };
+    try {
+      await session.setViewport(id, { width: info.width, height: info.height });
+    } catch { /* a busy tab can refuse; the report below still describes it */ }
   }
   const head = how === 'window'
     ? `Resized the window holding tab ${id} to ${w}x${h} via browser.setClientWindowState.`
@@ -571,7 +604,7 @@ async function resizeWindow(session, { width, height, tabId } = {}) {
 
 // --- form_input -----------------------------------------------------------
 
-async function formInput(session, { ref, value, tabId } = {}) {
+async function formInput(session, { ref, value, tabId, __inBatch: inBatch = false } = {}) {
   if (!ref || typeof ref !== 'string') {
     throw new Error('form_input: ref is required (an element id from read_page, e.g. "ref_1").');
   }
@@ -582,6 +615,7 @@ async function formInput(session, { ref, value, tabId } = {}) {
   if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
     throw new Error(`form_input: value must be a string, number or boolean (got ${Array.isArray(value) ? 'array' : typeof value}).`);
   }
+  requireExplicitTab('form_input', tabId, inBatch);
   const id = await resolveTab(session, tabId);
   await session.ensureRefStore(id);
 
@@ -633,6 +667,10 @@ function tools(ctx) {
         },
         required: ['url'],
       },
+      // src/batch.js adds `__inBatch: true` to the input of every item it runs;
+      // navigate then requires an explicit tabId instead of taking the group's
+      // first tab. The flag is private to that handshake - it is not in the
+      // schema above and is dropped where navigate() destructures its argument.
       handler: async (args) => {
         const session = await ctx.session();
         return navigate(session, args || {});
@@ -766,6 +804,7 @@ module.exports = {
   javascriptTool, resizeWindow, formInput,
   normalizeUrl, scanSource, splitLastStatement, stripTrailingComments, wrapForAwait,
   formatPageException, formatResult, stringifyValue,
+  missingTabId, requireExplicitTab,
   PAGE_INFO_FN, FORM_INPUT_FN, MAX_RESULT_CHARS,
   tools,
 };

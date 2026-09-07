@@ -19,6 +19,13 @@ const CLICK_HOLD = 30; // how long the button stays down
 const CLICK_GAP = 60; // between the pairs of a double/triple click
 const SCROLL_DURATION = 100;
 const MAX_CLICK_LOG = 200;
+// Synthetic input never leaves this machine: Firefox dispatches the events and
+// answers, which takes milliseconds. A command that outlives this is not slow,
+// it is stuck (a modal dialog, a renderer that stopped pumping its event loop),
+// and the default 60s BiDi timeout would only buy the model a long silence -
+// twice over, once for the action and once for the release that follows it.
+const INPUT_TIMEOUT = 5000;
+const RELEASE_TIMEOUT = 2000; // pure cleanup; never worth waiting on
 
 const CLICKS = {
   left_click: { button: 0, clicks: 1, verb: 'Clicked' },
@@ -283,17 +290,45 @@ function scrollActions({ x, y, direction, ticks }) {
   }];
 }
 
+// An alert/confirm/prompt freezes the page: input commands aimed at it are
+// never answered, so both the action and its release run out the clock.
+function dialogBlocking(session, tabId) {
+  let blocked = null;
+  try {
+    blocked = session.promptTabId();
+  } catch {
+    return false; // no prompt bookkeeping; treat the tab as usable
+  }
+  return blocked !== null && blocked !== undefined && Number(blocked) === Number(tabId);
+}
+
+const dialogHint = (tabId) =>
+  `Tab ${tabId} is blocked by a dialog, so the page takes no clicks or keystrokes. ` +
+  'Call firefox_dialog to accept or dismiss it, then try again.';
+
+function assertNoDialog(session, tabId) {
+  if (dialogBlocking(session, tabId)) throw new Error(dialogHint(tabId));
+}
+
 // A tick that fails (an out-of-bounds move, a closed tab) leaves the browser's
 // input state as it was: a button or a modifier can stay down and poison every
 // later action. Release it before the error goes back to the model.
 async function perform(session, tabId, sources) {
+  const context = session.requireContext(tabId);
+  assertNoDialog(session, tabId);
   try {
-    return await session.performActions(tabId, sources);
+    return await session.send('input.performActions', { context, actions: sources }, { timeout: INPUT_TIMEOUT });
   } catch (err) {
     try {
-      await session.send('input.releaseActions', { context: session.requireContext(tabId) });
+      await session.send('input.releaseActions', { context }, { timeout: RELEASE_TIMEOUT });
     } catch {
       /* nothing left to release, or the tab is gone with its state */
+    }
+    // The action itself can be what opened the dialog; say so rather than
+    // handing back a bare timeout the model cannot act on.
+    if (dialogBlocking(session, tabId)) {
+      const detail = String((err && err.message) || err).replace(/\s*\.?\s*$/, '');
+      throw new Error(`${detail}. ${dialogHint(tabId)}`);
     }
     throw err;
   }
@@ -301,11 +336,43 @@ async function perform(session, tabId, sources) {
 
 // --- page-side helpers ----------------------------------------------------
 
+// A ref the model still holds can point at something that is not rendered - a
+// menu that closed again, a display:none tab panel (read_page's default "all"
+// filter lists those on purpose). getBoundingClientRect is then all zeros, and
+// aiming at it would click the top-left corner of the page while reporting a
+// hit on the ref. Refuse, and say what would make the ref usable.
+function refPoint(session, tabId, ref, info, action) {
+  const width = Number(info.width) || 0;
+  const height = Number(info.height) || 0;
+  const x = Math.round(Number(info.x));
+  const y = Math.round(Number(info.y));
+  if (info.visible === false || width === 0 || height === 0 || !Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error(
+      `${ref} is on the page but not visible (read_page marks it "(not visible)"), so ${action} has nothing ` +
+      'to aim at. Open the menu, tab or section that holds it - or call read_page again and use a ref that ' +
+      'is showing - then retry.'
+    );
+  }
+  const viewport = session.viewportFor(tabId) || {};
+  const vw = Number(viewport.width) || 0;
+  const vh = Number(viewport.height) || 0;
+  if (x < 0 || y < 0 || (vw && x >= vw) || (vh && y >= vh)) {
+    const bounds = vw && vh ? `the ${vw}x${vh} viewport` : 'the viewport';
+    throw new Error(
+      `${ref} centres on (${x}, ${y}), outside ${bounds}, so ${action} cannot reach it even after scrolling ` +
+      'it into view. Scroll the container that holds it, then call read_page again for a fresh ref.'
+    );
+  }
+  return { x, y };
+}
+
 async function targetPoint(session, tabId, { coordinate, ref, action }) {
   if (ref !== undefined && ref !== null && ref !== '') {
+    assertNoDialog(session, tabId);
     await session.ensureRefStore(tabId);
     const info = await session.resolveRef(tabId, ref, { scroll: true });
-    return { x: info.x, y: info.y, ref: String(ref), element: info };
+    const { x, y } = refPoint(session, tabId, ref, info, action);
+    return { x, y, ref: String(ref), element: info };
   }
   if (coordinate !== undefined && coordinate !== null) return readCoordinate(coordinate);
   throw new Error(`${action} needs a coordinate [x, y] or a ref from read_page or find.`);
@@ -345,7 +412,7 @@ function saveImage(ctx, name, data, mimeType) {
 
 async function capture(session, tabId, { clip = null, kind, save = false, ctx }) {
   const shot = await session.screenshot(tabId, clip ? { clip } : {});
-  const viewport = session.viewportSize || { width: 0, height: 0 };
+  const viewport = session.viewportFor(tabId) || { width: 0, height: 0 };
   const width = clip ? clip.width : viewport.width;
   const height = clip ? clip.height : viewport.height;
   const imageId = session.images.put({ data: shot.data, mimeType: shot.mimeType, width, height });
@@ -428,14 +495,25 @@ async function typeAction(session, tabId, args) {
   if (typeof text !== 'string' || text === '') {
     throw new Error('the type action needs text to type.');
   }
+  // Chrome's type takes no target: the text goes to whatever holds focus. A ref
+  // is worth a click first - the model named that field - but a coordinate is
+  // often just carried over from the previous call, and clicking it would close
+  // the menu or leave the field the model had already focused. So: ref clicks,
+  // coordinate is ignored and the reply says so.
   let focused = '';
-  const hasTarget = (args.ref !== undefined && args.ref !== null && args.ref !== '')
-    || (args.coordinate !== undefined && args.coordinate !== null);
-  if (hasTarget) {
-    const point = await targetPoint(session, tabId, { coordinate: args.coordinate, ref: args.ref, action: 'type' });
+  const hasRef = args.ref !== undefined && args.ref !== null && args.ref !== '';
+  if (hasRef) {
+    const point = await targetPoint(session, tabId, { ref: args.ref, action: 'type' });
     await perform(session, tabId, pointerWithModifiers(clickActions({ x: point.x, y: point.y }), []));
     await logPointer(session, tabId, { type: 'left_click', x: point.x, y: point.y, label: 'type' });
-    focused = ` after clicking (${point.x}, ${point.y})`;
+    focused = ` after clicking ${point.ref} at (${point.x}, ${point.y})`;
+  }
+  let ignored = '';
+  if (args.coordinate !== undefined && args.coordinate !== null) {
+    ignored = hasRef
+      ? ` The coordinate was ignored: ${String(args.ref)} is what decided where the focus went.`
+      : ' The coordinate was ignored: type goes to whatever has keyboard focus, so click or hover it first,'
+        + ' or pass ref, to move focus.';
   }
   await perform(session, tabId, [keySource(typeActions(text))]);
   // Count what actually gets pressed: typeActions walks code points, so an emoji
@@ -443,7 +521,7 @@ async function typeAction(session, tabId, args) {
   const count = Array.from(text).length;
   const newlines = text.split('\n').length - 1;
   const enters = newlines ? ` including ${newlines} Enter press${newlines === 1 ? '' : 'es'}` : '';
-  return `Typed ${count} character${count === 1 ? '' : 's'}${enters}${focused}.`;
+  return `Typed ${count} character${count === 1 ? '' : 's'}${enters}${focused}.${ignored}`;
 }
 
 async function keyAction(session, tabId, args) {
@@ -473,7 +551,7 @@ async function screenshotAction(session, tabId, args, ctx) {
 }
 
 async function zoomAction(session, tabId, args, ctx) {
-  const clip = readRegion(args.region, session.viewportSize);
+  const clip = readRegion(args.region, session.viewportFor(tabId));
   const shot = await capture(session, tabId, { clip, kind: 'zoom', save: !!args.save_to_disk, ctx });
   const url = await pageUrl(session, tabId);
   const bits = [
@@ -489,9 +567,20 @@ async function scrollToAction(session, tabId, args) {
   if (args.ref === undefined || args.ref === null || args.ref === '') {
     throw new Error('scroll_to needs a ref from read_page or find.');
   }
+  assertNoDialog(session, tabId);
   await session.ensureRefStore(tabId);
   const info = await session.resolveRef(tabId, args.ref, { scroll: true });
   const tag = info.tag ? `<${info.tag}>` : 'element';
+  // A display:none element has a zero box at the origin: inViewport reads true
+  // for it, and reporting "fully in the viewport" would send the model straight
+  // into a click that cannot land. scroll_to still reports rather than refuses -
+  // it is the action that fixes a merely off-screen element - but it has to say
+  // which of the two cases this is.
+  if (info.visible === false || !(Number(info.width) > 0) || !(Number(info.height) > 0)) {
+    return `${args.ref} ${tag} is on the page but not visible (read_page marks it "(not visible)"), so ` +
+      'scrolling cannot bring it into view. Open the menu, tab or section that holds it, then call read_page ' +
+      'again and use a ref that is showing.';
+  }
   const placed = info.inViewport ? 'fully in the viewport' : 'still partly outside the viewport';
   return `Scrolled ${args.ref} ${tag} into view: center (${info.x}, ${info.y}), ${info.width}x${info.height}, ${placed}.`;
 }
@@ -650,5 +739,5 @@ module.exports = {
   readCoordinate, readRegion, readRepeat, readScrollAmount, readDuration,
   clickActions, dragActions, scrollActions, pointerWithModifiers,
   mouseSource, keySource, wheelSource,
-  CLICK_LOG_FN, PIXELS_PER_TICK, MAX_CLICK_LOG,
+  CLICK_LOG_FN, PIXELS_PER_TICK, MAX_CLICK_LOG, INPUT_TIMEOUT, RELEASE_TIMEOUT,
 };

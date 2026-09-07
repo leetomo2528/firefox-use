@@ -170,6 +170,13 @@ test('the parity surface drives a real page', { skip }, async (t) => {
     assert.equal(imagesOf(result).length, 0, 'the second item never ran');
   });
 
+  await t.test('a batch demands an explicit tabId, as Chrome does', async () => {
+    const result = await call('browser_batch', {
+      actions: [{ name: 'navigate', input: { url: `${base}/parity.html` } }],
+    }).catch((err) => ({ content: [{ type: 'text', text: err.message }], isError: true }));
+    assert.match(asText(result), /tabId/i, 'the batch says an explicit tabId is required');
+  });
+
   await t.test('file_upload attaches a real file', async () => {
     const tree = asText(await call('read_page', { tabId, filter: 'interactive' }));
     const fileLine = tree.split('\n').find((l) => /file/i.test(l) && /ref_\d+/.test(l));

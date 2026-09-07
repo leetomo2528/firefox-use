@@ -11,6 +11,8 @@ class FakeSession {
     this.calls = [];
     this.images = new (require('../../src/session').ImageStore)();
     this.viewportSize = { width: 1280, height: 800 };
+    this.viewports = new Map();
+    this.blockedTabId = null;
     this.platform = 'mac';
     this.listeners = new Map();
   }
@@ -58,7 +60,16 @@ class FakeSession {
     return this._next('screenshot', { data: Buffer.from('fake-png').toString('base64'), mimeType: opts.format === 'jpeg' ? 'image/jpeg' : 'image/png' });
   }
   async performActions(tabId, actions) { this._record('performActions', { tabId, actions }); this.requireContext(tabId); return {}; }
-  async setViewport(tabId, size) { this._record('setViewport', { tabId, ...size }); this.requireContext(tabId); this.viewportSize = { width: size.width, height: size.height }; return this.viewportSize; }
+  async setViewport(tabId, size) {
+    this._record('setViewport', { tabId, ...size });
+    this.requireContext(tabId);
+    const applied = { width: size.width, height: size.height };
+    this.viewports.set(Number(tabId), applied);
+    return applied;
+  }
+  // Each tab renders at its own size once resize_window touches one.
+  viewportFor(tabId) { return this.viewports.get(Number(tabId)) || this.viewportSize; }
+  promptTabId() { return this.blockedTabId ?? null; }
   async send(method, params, opts) { this._record('send', { method, params, opts }); return this._next('send', {}); }
   async subscribe(events) { this._record('subscribe', { events }); }
   on(event, handler) {

@@ -321,6 +321,48 @@ test('find says so plainly when nothing matches', async () => {
   assert.ok(!out.includes('ref_1'));
 });
 
+test('find reports a depth-cut tree instead of claiming nothing matched', async () => {
+  const nodes = [node('ref_1', { role: 'heading', tag: 'h1', name: 'Welcome' })];
+  const session = new FakeSession({
+    responses: { callJson: [treeResponse(nodes, { depth: 30, count: 120, clipped: true })] },
+  });
+  const out = await a11y.find(session, { query: 'login button', tabId: 1 });
+  assert.match(out, /No elements matched "login button" in the part of the page that was searched\./);
+  assert.match(out, /\[the tree was cut at depth 30: elements deeper than that were not searched/);
+  assert.match(out, /read_page with a larger depth, or with ref_id/);
+});
+
+test('find reports the element cap on a zero-match answer', async () => {
+  const session = new FakeSession({
+    responses: { callJson: [treeResponse([], { depth: 30, count: 5000, capped: true })] },
+  });
+  const out = await a11y.find(session, { query: 'checkout', tabId: 1 });
+  assert.match(out, /No elements matched "checkout" in the part of the page that was searched\./);
+  assert.match(out, /\[element limit reached: only the first 5000 elements were searched/);
+});
+
+test('find keeps the cut notices under a list of matches', async () => {
+  const nodes = [node('ref_7', { role: 'button', tag: 'button', name: 'Sign in', interactive: true })];
+  const session = new FakeSession({
+    responses: { callJson: [treeResponse(nodes, { depth: 30, count: 5000, clipped: true, capped: true })] },
+  });
+  const out = await a11y.find(session, { query: 'sign in', tabId: 1 });
+  assert.match(out, /1 match for "sign in":/);
+  assert.match(out, /\[ref_7\] button "Sign in"/);
+  const tail = out.split('\n').slice(-2);
+  assert.match(tail[0], /^\[the tree was cut at depth 30:/);
+  assert.match(tail[1], /^\[element limit reached: only the first 5000 elements were searched/);
+});
+
+test('find stays quiet about limits on a whole tree', async () => {
+  const nodes = [node('ref_1', { role: 'button', tag: 'button', name: 'Sign in', interactive: true })];
+  const session = new FakeSession({ responses: { callJson: [treeResponse(nodes, { depth: 30, count: 1 })] } });
+  const out = await a11y.find(session, { query: 'zebra', tabId: 1 });
+  assert.match(out, /No elements matched "zebra"\. Try different wording/);
+  assert.ok(!out.includes('cut at depth'), 'no depth note on a complete tree');
+  assert.ok(!out.includes('element limit reached'), 'no cap note on a complete tree');
+});
+
 test('find needs a query and walks the whole tree', async () => {
   const session = new FakeSession({ responses: { callJson: [treeResponse([])] } });
   await assert.rejects(() => a11y.find(session, { tabId: 1, query: '   ' }), /find requires a query/);
@@ -486,9 +528,46 @@ test('TREE_FN walks an open shadow root so web components are visible', () => {
   assert.strictEqual(dom.window.__ffuse.refs.get(data.nodes[0].ref).localName, 'button');
 });
 
-test('TREE_FN guards DOM nesting that the depth limit does not bound', () => {
-  // filter=interactive counts only emitted levels, so nothing stops the walk from
-  // recursing as deep as the DOM goes; the raw guard has to.
+test('TREE_FN depth bounds an interactive read, not only the emitted levels', () => {
+  let nest = E('button', { rect: r(0, 0, 40, 20) }, ['Deep']);
+  for (let i = 0; i < 6; i++) nest = E('div', {}, [nest]); // button sits at DOM depth 6
+  const dom = makeDom({ body: E('body', {}, [nest]) });
+
+  const full = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 15, refId: '', cap: 5000 });
+  assert.deepStrictEqual(full.nodes.map((n) => n.name), ['Deep']);
+  assert.strictEqual(full.clipped, false, 'nothing was cut, so no depth note');
+
+  const shallow = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 3, refId: '', cap: 5000 });
+  assert.deepStrictEqual(shallow.nodes, [], 'depth 3 does not reach a button 6 levels down');
+  assert.strictEqual(shallow.clipped, true);
+  assert.match(a11y.renderTree(shallow), /\[depth limit 3 reached/);
+
+  const edge = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 7, refId: '', cap: 5000 });
+  assert.deepStrictEqual(edge.nodes.map((n) => n.name), ['Deep'], 'depth 7 reaches DOM level 6');
+  assert.strictEqual(edge.clipped, false);
+});
+
+test('TREE_FN keeps interactive output identical to a full read at the same depth', () => {
+  // The shallow walk must not claim a cut that a full walk of the same depth
+  // would not have made.
+  const dom = shopDom();
+  const data = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 15, refId: '', cap: 5000 });
+  assert.deepStrictEqual(data.nodes.map((n) => n.role), ['button', 'searchbox']);
+  assert.strictEqual(data.clipped, false);
+
+  // Wrapper divs past the limit hold nothing an interactive read would have
+  // listed, so descending through them is not a cut.
+  let nest = E('div', {}, ['leaf text']);
+  for (let i = 0; i < 20; i++) nest = E('div', {}, [nest]);
+  const deep = makeDom({ body: E('body', {}, [E('button', { rect: r(0, 0, 40, 20) }, ['Top']), nest]) });
+  const read = runPageFn(deep, a11y.TREE_FN, { filter: 'interactive', depth: 15, refId: '', cap: 5000 });
+  assert.deepStrictEqual(read.nodes.map((n) => n.name), ['Top']);
+  assert.strictEqual(read.clipped, false, 'empty depth is not a cut');
+});
+
+test('TREE_FN guards DOM nesting deeper than the depth limit', () => {
+  // Levels past the depth limit are still walked so clipped stays honest, so a
+  // pathological nesting depth still needs the raw guard to stop the recursion.
   let nest = E('button', { rect: r(0, 0, 40, 20) }, ['Deep']);
   for (let i = 0; i < 1200; i++) nest = E('div', {}, [nest]);
   const dom = makeDom({ body: E('body', {}, [nest]) });
@@ -502,6 +581,66 @@ test('TREE_FN respects the element cap', () => {
   const data = runPageFn(dom, a11y.TREE_FN, { filter: 'all', depth: 15, refId: '', cap: 2 });
   assert.strictEqual(data.capped, true);
   assert.strictEqual(data.count, 2);
+});
+
+test('TREE_FN reports text the depth limit cut, but not blank text', () => {
+  const dom = makeDom({ body: E('body', {}, [E('p', { rect: r(0, 0, 100, 20) }, ['Body copy'])]) });
+  const cut = runPageFn(dom, a11y.TREE_FN, { filter: 'all', depth: 1, refId: '', cap: 5000 });
+  assert.deepStrictEqual(cut.nodes.map((n) => n.children.length), [0], 'the StaticText child was dropped');
+  assert.strictEqual(cut.clipped, true, 'dropping the text is a cut worth reporting');
+
+  const blank = makeDom({ body: E('body', {}, [E('p', { rect: r(0, 0, 100, 20) }, ['   '])]) });
+  const data = runPageFn(blank, a11y.TREE_FN, { filter: 'all', depth: 1, refId: '', cap: 5000 });
+  assert.strictEqual(data.clipped, false, 'whitespace between tags is not content');
+});
+
+test('TREE_FN evicts the oldest refs instead of pinning every element forever', () => {
+  const dom = makeDom({
+    body: E('body', {}, [
+      E('button', { rect: r(0, 0, 40, 20) }, ['One']),
+      E('button', { rect: r(0, 30, 40, 20) }, ['Two']),
+      E('button', { rect: r(0, 60, 40, 20) }, ['Three']),
+    ]),
+  });
+  const opts = { filter: 'interactive', depth: 15, refId: '', cap: 5000, refCap: 6 };
+  const first = runPageFn(dom, a11y.TREE_FN, opts);
+  const refs = dom.window.__ffuse.refs;
+  assert.strictEqual(refs.size, 3);
+
+  for (let i = 0; i < 5; i++) runPageFn(dom, a11y.TREE_FN, opts);
+  assert.ok(refs.size <= 6, `store stayed bounded (${refs.size})`);
+  assert.strictEqual(dom.window.__ffuse.next, 19, 'ids keep climbing, they are never reused');
+
+  // The read that just ran is fully resolvable; the first read has aged out.
+  const last = runPageFn(dom, a11y.TREE_FN, opts);
+  for (const n of last.nodes) assert.strictEqual(refs.get(n.ref).localName, 'button', `${n.ref} still resolves`);
+  for (const n of first.nodes) assert.strictEqual(refs.get(n.ref), undefined, `${n.ref} was evicted`);
+});
+
+test('TREE_FN never evicts a ref from the read it is running', () => {
+  const dom = makeDom({
+    body: E('body', {}, [
+      E('button', { rect: r(0, 0, 40, 20) }, ['One']),
+      E('button', { rect: r(0, 30, 40, 20) }, ['Two']),
+      E('button', { rect: r(0, 60, 40, 20) }, ['Three']),
+    ]),
+  });
+  // A cap smaller than one read's output must not cost the caller a usable ref.
+  const data = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 15, refId: '', cap: 5000, refCap: 1 });
+  assert.strictEqual(data.nodes.length, 3);
+  const refs = dom.window.__ffuse.refs;
+  for (const n of data.nodes) assert.strictEqual(refs.get(n.ref).localName, 'button', `${n.ref} survived the cap`);
+});
+
+test('TREE_FN keeps the seeded ref counter of an existing store', () => {
+  const dom = makeDom({ body: E('body', {}, [E('button', { rect: r(0, 0, 40, 20) }, ['Go'])]) });
+  // session.ensureRefStore seeds next per document, in blocks; a store that has
+  // been seeded but not yet filled must keep its block, not restart at ref_1.
+  dom.window.__ffuse = { next: 30001, clicks: [] };
+  const data = runPageFn(dom, a11y.TREE_FN, { filter: 'interactive', depth: 15, refId: '', cap: 5000 });
+  assert.strictEqual(data.nodes[0].ref, 'ref_30001');
+  assert.strictEqual(dom.window.__ffuse.refs.get('ref_30001').localName, 'button');
+  assert.deepStrictEqual(dom.window.__ffuse.clicks, [], 'the rest of the store is left alone');
 });
 
 test('TEXT_FN prefers the article and strips navigation and scripts', () => {
@@ -530,6 +669,103 @@ test('TEXT_FN prefers the article and strips navigation and scripts', () => {
     assert.ok(!data.text.includes(noise), `stripped: ${noise}`);
   }
   assert.ok(!/\n{3,}/.test(data.text), 'paragraph breaks collapsed');
+});
+
+const FILLER = 'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. ';
+
+test('TEXT_FN returns every teaser on an index page, not just the first article', () => {
+  const cards = [];
+  for (let i = 1; i <= 6; i++) {
+    cards.push(E('article', {}, [
+      E('h2', {}, [`Post number ${i}`]),
+      E('p', {}, [`Teaser ${i}. ${FILLER}${FILLER}${FILLER}`]),
+    ]));
+  }
+  const dom = makeDom({
+    title: 'The blog',
+    url: 'https://blog.test/',
+    body: E('body', {}, [E('nav', {}, ['Home About']), E('div', { attrs: { id: 'feed' } }, cards)]),
+  });
+  const data = runPageFn(dom, a11y.TEXT_FN);
+  assert.strictEqual(data.source, 'articles');
+  for (let i = 1; i <= 6; i++) {
+    assert.match(data.text, new RegExp(`Post number ${i}`), `card ${i} is in the text`);
+    assert.match(data.text, new RegExp(`Teaser ${i}\\.`), `card ${i} body is in the text`);
+  }
+  assert.ok(!data.text.includes('Home About'), 'nav is still stripped');
+  assert.ok(!/\n{3,}/.test(data.text), 'cards are separated by one blank line');
+});
+
+test('TEXT_FN measures the page by its readable text, not by its script payloads', () => {
+  // A hydration blob is bigger than the prose on most framework-rendered pages.
+  // Counting it as page text makes every article look like a sliver of the page,
+  // which sends the whole index back down the density path - one card again.
+  const cards = [];
+  for (let i = 1; i <= 6; i++) {
+    cards.push(E('article', {}, [
+      E('h2', {}, [`Post number ${i}`]),
+      E('p', {}, [`Teaser ${i}. ${FILLER.repeat(6)}`]),
+    ]));
+  }
+  const blob = `window.__NEXT_DATA__="${'a'.repeat(20000)}";`;
+  const dom = makeDom({
+    title: 'The blog',
+    url: 'https://blog.test/',
+    body: E('body', {}, [...cards, E('script', {}, [blob])]),
+  });
+  const data = runPageFn(dom, a11y.TEXT_FN);
+  assert.strictEqual(data.source, 'articles');
+  for (let i = 1; i <= 6; i++) assert.match(data.text, new RegExp(`Post number ${i}`), `card ${i} survived`);
+  assert.ok(!data.text.includes('__NEXT_DATA__'), 'the blob itself is not page text');
+});
+
+test('TEXT_FN keeps the long article when a page mixes one feature with stubs', () => {
+  const dom = makeDom({
+    title: 'A post',
+    url: 'https://blog.test/p',
+    body: E('body', {}, [
+      E('article', { attrs: { id: 'stub' } }, [E('p', {}, [`Related teaser. ${FILLER.repeat(3)}`])]),
+      E('article', { attrs: { id: 'feature' } }, [
+        E('h1', {}, ['The Feature']),
+        E('p', {}, [`Feature body. ${FILLER.repeat(20)}`]),
+      ]),
+    ]),
+  });
+  const data = runPageFn(dom, a11y.TEXT_FN);
+  assert.strictEqual(data.source, 'article', 'the stub is not comparable in size');
+  assert.match(data.text, /^The Feature\n\nFeature body\./);
+  assert.ok(!data.text.includes('Related teaser'), 'the small stub is left out');
+});
+
+test('TEXT_FN ignores a sidebar article that is a sliver of the page', () => {
+  const dom = makeDom({
+    title: 'Docs',
+    url: 'https://docs.test/p',
+    body: E('body', {}, [
+      E('aside', {}, [E('article', {}, [E('p', {}, [`Sponsored. ${FILLER}${FILLER}${FILLER}`])])]),
+      E('main', {}, [
+        E('h1', {}, ['Real content']),
+        E('p', {}, [`Body. ${FILLER.repeat(40)}`]),
+      ]),
+    ]),
+  });
+  const data = runPageFn(dom, a11y.TEXT_FN);
+  assert.strictEqual(data.source, 'main');
+  assert.match(data.text, /^Real content\n\nBody\./);
+  assert.ok(!data.text.includes('Sponsored'), 'the sidebar article is not the page text');
+});
+
+test('TEXT_FN counts a nested article only once', () => {
+  const inner = E('article', { attrs: { id: 'inner' } }, [E('p', {}, [`Inner. ${FILLER.repeat(4)}`])]);
+  const dom = makeDom({
+    title: 'Wrapped',
+    url: 'https://blog.test/w',
+    body: E('body', {}, [E('article', { attrs: { id: 'outer' } }, [E('h1', {}, ['Outer']), inner])]),
+  });
+  const data = runPageFn(dom, a11y.TEXT_FN);
+  assert.strictEqual(data.source, 'article');
+  assert.strictEqual(data.text.match(/Inner\./g).length, 1, 'the nested article is not extracted twice');
+  assert.match(data.text, /^Outer/);
 });
 
 // --- tool definitions ------------------------------------------------------

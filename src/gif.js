@@ -6,6 +6,8 @@
 // the previous frame, so overlays land on the frame that shows their effect.
 // Export decodes, downscales, draws overlays, quantizes and encodes through
 // src/gifenc.js, which is injectable so this module unit-tests on its own.
+// It runs frame by frame with a turn of the event loop between frames: a full
+// 120-frame export is seconds of CPU, and the server has to stay answerable.
 
 const path = require('path');
 const nodeFs = require('fs');
@@ -198,6 +200,13 @@ function stripControl(value) {
   return out;
 }
 
+// One turn of the event loop. Export is the only long-running call in the
+// server, so it hands control back between frames instead of blocking every
+// other tool for the whole encode.
+function nextTurn() {
+  return new Promise((resolve) => { setImmediate(resolve); });
+}
+
 function safeFilename(name) {
   const base = path.basename(stripControl(name).replace(/\\/g, '/')).trim();
   if (!base || base === '.' || base === '..') throw new Error(`Invalid filename: ${JSON.stringify(name)}`);
@@ -215,6 +224,7 @@ class GifRecorder {
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
     now = Date.now,
+    yieldFn = null,
   } = {}) {
     this._gifenc = gifenc;
     this.fs = fs;
@@ -225,6 +235,9 @@ class GifRecorder {
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
     this.now = now;
+    // Never the injected setTimeoutFn: a test clock that queues timers by hand
+    // would stall the export it is driving.
+    this.yieldFn = typeof yieldFn === 'function' ? yieldFn : nextTurn;
     this.byTab = new Map(); // tabId -> recording state
     this.exports = 0;
   }
@@ -410,45 +423,65 @@ class GifRecorder {
     }
 
     const gifenc = this.gifenc;
-    const decoded = rec.frames.map((frame, i) => {
-      let out;
+    // The export yields between frames, so it works off a snapshot: whatever
+    // lands on rec.frames meanwhile belongs to the next export, not this one.
+    const frames = rec.frames.slice();
+
+    // Decode and downscale in one pass. A decoded 1280x800 frame is 4 MB of
+    // RGBA, so keeping all 120 alive to read their widths later peaked near
+    // half a gigabyte; each full-size frame is released the moment it has been
+    // resized, and the scale factor rides along with the sized frame because
+    // the original width is gone by the time overlays are placed.
+    const kept = [];
+    let targetWidth = 0;
+    let width = 0;
+    let height = 0;
+    let skipped = 0;
+    for (let i = 0; i < frames.length; i++) {
+      await this._yield();
+      let decoded;
       try {
-        out = gifenc.decodePng(frame.data);
+        decoded = gifenc.decodePng(frames[i].data);
       } catch (err) {
         throw new Error(`Frame ${i + 1} of tab ${tabId} could not be decoded: ${err.message}`);
       }
-      if (!out || !out.width || !out.height) throw new Error(`Frame ${i + 1} of tab ${tabId} could not be decoded.`);
-      return out;
-    });
-
-    const targetWidth = Math.min(this.maxWidth, decoded[0].width);
-    const sized = decoded.map((frame) => (frame.width === targetWidth ? frame : gifenc.resizeRgba(frame, targetWidth)));
-    const width = sized[0].width;
-    const height = sized[0].height;
-
-    const kept = [];
-    let skipped = 0;
-    for (let i = 0; i < sized.length; i++) {
-      const frame = sized[i];
+      if (!decoded || !decoded.width || !decoded.height) {
+        throw new Error(`Frame ${i + 1} of tab ${tabId} could not be decoded.`);
+      }
+      const fullWidth = decoded.width;
+      if (i === 0) targetWidth = Math.min(this.maxWidth, fullWidth);
+      const frame = fullWidth === targetWidth ? decoded : gifenc.resizeRgba(decoded, targetWidth);
+      decoded = null; // the full-size pixels are unreachable from here on
+      if (i === 0) { width = frame.width; height = frame.height; }
       // A viewport resize mid-recording yields a frame the GIF canvas cannot hold.
       if (!frame || frame.width !== width || frame.height !== height) { skipped++; continue; }
-      kept.push({ frame, events: rec.frames[i].events || [], scale: targetWidth / decoded[i].width });
+      kept.push({ frame, events: frames[i].events || [], scale: targetWidth / fullWidth });
     }
     if (!kept.length) throw new Error(`No frames of tab ${tabId} match ${width}x${height}; nothing to encode.`);
 
     const measure = typeof gifenc.textSize === 'function' ? gifenc.textSize : undefined;
-    const drawn = kept.map((entry, i) => {
-      const ops = overlayOps({ width, height, events: entry.events, index: i, total: kept.length, options, scale: entry.scale, measure });
-      if (!ops.length) return entry.frame;
-      return gifenc.drawOverlays(entry.frame, ops) || entry.frame;
-    });
+    const total = kept.length;
+    const drawn = [];
+    for (let i = 0; i < total; i++) {
+      await this._yield();
+      const entry = kept[i];
+      kept[i] = null; // drawn owns the pixels now
+      const ops = overlayOps({ width, height, events: entry.events, index: i, total, options, scale: entry.scale, measure });
+      drawn.push(ops.length ? (gifenc.drawOverlays(entry.frame, ops) || entry.frame) : entry.frame);
+    }
 
+    await this._yield();
     const maxColors = paletteSize(options.quality);
     const quantized = gifenc.quantize(drawn, maxColors, { dither: ditherFor(options.quality) });
     if (!quantized || !quantized.palette || !quantized.indexed || !quantized.indexed.length) {
       throw new Error('Color quantization returned no frames.');
     }
-    const delayMs = frameDelay(rec.frames, this.intervalMs);
+    // Indexed frames are their own buffers, so the RGBA strip can be dropped
+    // before the encoder starts allocating.
+    drawn.length = 0;
+    kept.length = 0;
+    await this._yield();
+    const delayMs = frameDelay(frames, this.intervalMs);
     const buf = gifenc.encodeGif({
       frames: quantized.indexed,
       palette: quantized.palette,
@@ -465,9 +498,14 @@ class GifRecorder {
     this.fs.writeFileSync(file, buf);
 
     const skipNote = skipped ? ` Skipped ${skipped} frame(s) that did not match ${width}x${height}.` : '';
-    return `Exported ${kept.length} frame(s) of tab ${tabId} to ${file} `
+    return `Exported ${total} frame(s) of tab ${tabId} to ${file} `
       + `(${width}x${height}, ${(buf.length / 1024).toFixed(1)} KB, ${maxColors} colors, ${delayMs}ms per frame, quality ${options.quality}). `
-      + `Frames kept: ${rec.frames.length}; call gif_creator with action "clear" to discard them.${skipNote}${note}`;
+      + `Frames kept: ${frames.length}; call gif_creator with action "clear" to discard them.${skipNote}${note}`;
+  }
+
+  // Hands the event loop back so an export never monopolises the server.
+  _yield() {
+    return this.yieldFn();
   }
 
   _resolveName(filename, dir) {
