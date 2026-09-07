@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 'use strict';
-// firefox-use - browser control for Claude Code, backed by Firefox's WebDriver BiDi.
+// firefox-use - the Claude-in-Chrome tool surface, driving Firefox over WebDriver BiDi.
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const launcher = require('../src/launcher');
 const { McpServer } = require('../src/mcp');
-const { BrowserHandle, buildTools } = require('../src/tools');
-const { FirefoxBrowser } = require('../src/browser');
+const { Session } = require('../src/session');
 const pkg = require('../package.json');
 
 const args = process.argv.slice(2);
@@ -35,10 +36,11 @@ Commands:
   start [url]         Launch Firefox with WebDriver BiDi enabled
   stop                Quit the Firefox instance started by firefox-use
   restart             Stop and start again, clearing a stale automation session
-  status              Show whether Firefox is running, plus the open tabs
+  status              Show whether Firefox is running, plus this session's tabs
   open <url>          Open a URL in the running instance (starting it if needed)
-  shot <file> [url]   Save a screenshot to a PNG file
-  install             Register this server with Claude Code (claude mcp add)
+  shot <file> [url]   Save a screenshot to a PNG file (--full for the whole page)
+  install             Register with Claude Code as claude-in-firefox (claude mcp add)
+  install-skill       Install the claude-in-firefox skill into ~/.claude/skills
   doctor              Check Firefox, the profile, the port and the BiDi handshake
 
 Options:
@@ -47,27 +49,28 @@ Options:
   --profile <dir>     Firefox profile directory (default ~/.firefox-use/profile)
 `;
 
-async function withBrowser(fn) {
-  const browser = await FirefoxBrowser.open(options);
+async function withSession(fn) {
+  const session = await Session.open(options);
   try {
-    return await fn(browser);
+    return await fn(session);
   } finally {
-    await browser.close();
+    await session.close();
   }
 }
 
 async function main() {
   switch (command) {
     case 'mcp': {
-      const handle = new BrowserHandle(options);
+      const { ToolHost } = require('../src/tools');
+      const host = new ToolHost(options);
       const server = new McpServer({
         name: 'firefox-use',
         version: pkg.version,
-        tools: buildTools(handle),
-        onShutdown: () => handle.close(),
+        tools: host.tools(),
+        onShutdown: () => host.close(),
       });
       server.start();
-      server.log(`ready (firefox ${launcher.findFirefox() || 'NOT FOUND'})`);
+      server.log(`ready - ${host.tools().length} tools, firefox ${launcher.findFirefox() || 'NOT FOUND'}`);
       return new Promise(() => {}); // run until stdin closes or a signal arrives
     }
 
@@ -99,10 +102,10 @@ async function main() {
       console.log(`profile: ${st.profile}`);
       console.log(`log:     ${st.logFile}`);
       if (!st.reachable) return;
-      await withBrowser(async (b) => {
-        const info = await b.pageInfo();
+      await withSession(async (session) => {
+        const tabs = await session.listTabs();
         console.log('tabs:');
-        for (const t of info.tabs) console.log(`${t.current ? '*' : ' '} [${t.index}] ${t.url}`);
+        for (const tab of tabs) console.log(`  [${tab.tabId}] ${tab.url}`);
       });
       return;
     }
@@ -110,9 +113,11 @@ async function main() {
     case 'open': {
       const url = args.find((a) => !a.startsWith('--'));
       if (!url) throw new Error('usage: firefox-use open <url>');
-      await withBrowser(async (b) => {
-        const res = await b.navigate(url);
-        console.log(`Loaded ${res.url}`);
+      await withSession(async (session) => {
+        const tabId = await session.defaultTabId();
+        const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `https://${url}`;
+        const res = await session.navigate(tabId, target);
+        console.log(`Loaded ${res.url} in tab ${tabId}`);
       });
       return;
     }
@@ -121,10 +126,14 @@ async function main() {
       const positional = args.filter((a) => !a.startsWith('--'));
       const file = positional[0];
       if (!file) throw new Error('usage: firefox-use shot <file.png> [url]');
-      await withBrowser(async (b) => {
-        if (positional[1]) await b.navigate(positional[1]);
-        const shot = await b.screenshot({ fullPage: flag('full') === true });
-        require('fs').writeFileSync(file, Buffer.from(shot.data, 'base64'));
+      await withSession(async (session) => {
+        const tabId = await session.defaultTabId();
+        if (positional[1]) {
+          const target = /^[a-z][a-z0-9+.-]*:/i.test(positional[1]) ? positional[1] : `https://${positional[1]}`;
+          await session.navigate(tabId, target);
+        }
+        const shot = await session.screenshot(tabId, { fullPage: flag('full') === true });
+        fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
         console.log(`Saved ${file}`);
       });
       return;
@@ -133,12 +142,28 @@ async function main() {
     case 'install': {
       const entry = path.resolve(__dirname, 'firefox-use');
       const scope = typeof flag('scope') === 'string' ? flag('scope') : 'user';
-      const res = spawnSync('claude', ['mcp', 'add', 'firefox', '--scope', scope, '--', process.execPath, entry, 'mcp'], {
+      // Registering under this name makes the tools read as
+      // mcp__claude-in-firefox__computer, one word away from Chrome's.
+      const name = typeof flag('name') === 'string' ? flag('name') : 'claude-in-firefox';
+      spawnSync('claude', ['mcp', 'remove', 'firefox', '--scope', scope], { stdio: 'ignore' });
+      const res = spawnSync('claude', ['mcp', 'add', name, '--scope', scope, '--', process.execPath, entry, 'mcp'], {
         stdio: 'inherit',
       });
       if (res.error) throw new Error(`could not run claude: ${res.error.message}`);
       if (res.status !== 0) throw new Error(`claude mcp add exited with ${res.status}`);
-      console.log('\nRegistered. Start a new Claude Code session and ask it to use the firefox_* tools.');
+      console.log('\nRegistered. Run `firefox-use install-skill`, then start a new Claude Code session.');
+      return;
+    }
+
+    case 'install-skill': {
+      const src = path.resolve(__dirname, '..', 'skills', 'claude-in-firefox');
+      const dest = path.join(os.homedir(), '.claude', 'skills', 'claude-in-firefox');
+      if (!fs.existsSync(src)) throw new Error(`skill source missing: ${src}`);
+      fs.mkdirSync(dest, { recursive: true });
+      for (const entry of fs.readdirSync(src)) {
+        fs.copyFileSync(path.join(src, entry), path.join(dest, entry));
+      }
+      console.log(`Installed the claude-in-firefox skill to ${dest}`);
       return;
     }
 
@@ -149,13 +174,15 @@ async function main() {
       const st = await launcher.status();
       console.log(`port ${st.port}: ${st.reachable ? 'open' : 'closed'}`);
       console.log(`profile: ${st.profile}`);
-      const browser = await FirefoxBrowser.open(options);
-      const version = await browser.evaluate('navigator.userAgent');
-      const info = await browser.pageInfo();
-      console.log(`BiDi session: ok (${browser.sessionId || 'existing session'})`);
-      console.log(`user agent: ${version}`);
-      console.log(`tabs: ${info.tabs.length}`);
-      await browser.close();
+      const { ToolHost } = require('../src/tools');
+      const host = new ToolHost(options);
+      console.log(`tools registered: ${host.tools().length}`);
+      const session = await host.session();
+      const tabId = await session.defaultTabId();
+      console.log(`BiDi session: ok (${session.sessionId || 'existing session'})`);
+      console.log(`user agent: ${await session.evaluate(tabId, 'navigator.userAgent')}`);
+      console.log(`tabs: ${(await session.listTabs()).length}`);
+      await host.close();
       console.log('All checks passed.');
       return;
     }

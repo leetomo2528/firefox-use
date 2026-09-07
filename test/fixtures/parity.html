@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Parity Fixture</title>
+<style>
+  body { font: 16px system-ui; margin: 0; padding: 24px; }
+  #tall { height: 1800px; }
+  .row { margin: 12px 0; }
+</style>
+<h1>Parity Fixture</h1>
+
+<div class="row">
+  <label for="name">Your name</label>
+  <input id="name" placeholder="Your name">
+  <button id="greet" onclick="document.getElementById('out').textContent = 'HELLO ' + document.getElementById('name').value.toUpperCase()">Greet</button>
+</div>
+
+<div class="row">
+  <select id="fruit">
+    <option value="a">Apple</option>
+    <option value="b">Banana</option>
+    <option value="c">Cherry</option>
+  </select>
+  <label><input type="checkbox" id="agree"> I agree</label>
+  <input type="file" id="upload">
+</div>
+
+<p id="out">nothing yet</p>
+<p id="filecount">files: 0</p>
+<a href="#bottom">Jump to bottom</a>
+
+<div id="tall">scroll area</div>
+<div id="bottom">bottom marker</div>
+
+<script>
+  console.log('[fixture] page loaded ok');
+  console.warn('[fixture] a warning');
+  document.getElementById('upload').addEventListener('change', (e) => {
+    document.getElementById('filecount').textContent = 'files: ' + e.target.files.length +
+      ' ' + Array.from(e.target.files).map((f) => f.name).join(',');
+  });
+  // Real network activity for read_network_requests.
+  fetch('./ping.json').then((r) => r.json()).then((d) => console.log('[fixture] ping', d.ok)).catch(() => {});
+</script>
