@@ -7,7 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { Session, sleep } = require('./session');
+const { Session, ImageStore, sleep } = require('./session');
 const observers = require('./observers');
 const launcher = require('./launcher');
 
@@ -31,6 +31,11 @@ class ToolHost {
     this.opts = opts;
     this.current = null;
     this._opening = null;
+    this._restarting = null;
+    // Screenshot ids and tab ids outlive a single BiDi connection: the model
+    // may hold an imageId or tabId from before a reconnect.
+    this.images = new ImageStore();
+    this.tabIds = [];
     this.config = { downloadDir: opts.downloadDir || DOWNLOAD_DIR };
     fs.mkdirSync(this.config.downloadDir, { recursive: true });
     this.registry = new Map();
@@ -51,13 +56,23 @@ class ToolHost {
   async session() {
     if (this.current && !this.current.conn.closed) return this.current;
     if (!this._opening) {
-      this._opening = Session.open(this.opts)
+      this._opening = Session.open({ ...this.opts, images: this.images, tabIds: this.tabIds })
         .then(async (s) => {
-          // Console and network capture has to start with the session, not with
-          // the first read_* call, or the page load that matters is already gone.
-          await observers.attach(s);
+          try {
+            // Console and network capture has to start with the session, not
+            // with the first read_* call, or the page load that matters is
+            // already gone.
+            await observers.attach(s);
+          } catch (err) {
+            await s.close().catch(() => {});
+            throw err;
+          }
           this.current = s;
-          s.conn.on('close', () => { if (this.current === s) this.current = null; });
+          s.conn.on('close', () => {
+            if (this.current !== s) return;
+            this.tabIds = [...s.tabs.byContext.entries()];
+            this.current = null;
+          });
           return s;
         })
         .finally(() => { this._opening = null; });
@@ -76,18 +91,27 @@ class ToolHost {
   }
 
   async close() {
+    // A session that is still opening still has to be closed, or the BiDi
+    // session it holds outlives the process and blocks the next client.
+    if (this._opening) await this._opening.catch(() => {});
     if (!this.current) return;
     const session = this.current;
+    this.tabIds = [...session.tabs.byContext.entries()];
     this.current = null;
     await session.close();
   }
 
   async restart() {
-    await this.close();
-    await launcher.stop();
-    await sleep(1000);
-    await launcher.launch(this.opts);
-    return this.session();
+    if (this._restarting) return this._restarting;
+    this._restarting = (async () => {
+      await this.close();
+      this.tabIds = []; // a new browser means new contexts
+      await launcher.stop();
+      await sleep(1000);
+      await launcher.launch(this.opts);
+      return this.session();
+    })().finally(() => { this._restarting = null; });
+    return this._restarting;
   }
 
   managementTools() {
@@ -109,6 +133,8 @@ class ToolHost {
             const session = await this.session();
             const tabs = await session.listTabs();
             lines.push(`viewport: ${session.viewportSize.width}x${session.viewportSize.height}`);
+            const blocked = session.promptTabId();
+            if (blocked) lines.push(`dialog open on tab ${blocked} - use firefox_dialog`);
             lines.push(tabs.length ? 'tabs:' : 'tabs: (none in this session\'s group)');
             for (const tab of tabs) lines.push(`  [${tab.tabId}] ${tab.url}`);
           }
@@ -140,7 +166,8 @@ class ToolHost {
         },
         handler: async ({ action, text, tabId }) => {
           const session = await this.session();
-          const id = tabId ?? (await session.defaultTabId());
+          // Answer the tab that is actually blocked, not tab 1.
+          const id = tabId ?? session.promptTabId() ?? (await session.defaultTabId());
           const handled = await session.handleUserPrompt(id, action !== 'dismiss', text);
           return handled
             ? `${action === 'dismiss' ? 'Dismissed' : 'Accepted'} ${handled.type} dialog: ${handled.message || ''}`.trim()

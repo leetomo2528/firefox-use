@@ -115,6 +115,17 @@ class TabRegistry {
     this.windowContext = null; // clientWindow the group lives in
   }
 
+  // Re-opening the BiDi connection must not renumber tabs the model already
+  // knows about: the same context keeps the id it had.
+  seed(entries) {
+    for (const [context, tabId] of entries) {
+      if (this.byContext.has(context)) continue;
+      this.byTabId.set(tabId, context);
+      this.byContext.set(context, tabId);
+      this.next = Math.max(this.next, tabId + 1);
+    }
+  }
+
   add(context) {
     if (this.byContext.has(context)) return this.byContext.get(context);
     const tabId = this.next++;
@@ -180,19 +191,26 @@ class Session {
     this.viewportSize = opts.viewport || DEFAULT_VIEWPORT;
     this.platform = 'mac';
     this.tabs = new TabRegistry();
-    this.images = new ImageStore();
+    this.images = opts.images || new ImageStore();
     this.listeners = new Map(); // eventName -> Set(handler)
     this._sized = new Set();
     this._booted = new Set();
-    this.pendingPrompt = null;
+    this._viewports = new Map(); // context -> {width, height}
+    this._prompts = new Map(); // context -> userPromptOpened params
+    if (opts.tabIds) this.tabs.seed(opts.tabIds);
 
     conn.on('event', (method, params) => this._dispatch(method, params));
     conn.on('browsingContext.contextDestroyed', (p) => {
       this.tabs.remove(p.context);
       this._sized.delete(p.context);
       this._booted.delete(p.context);
+      this._viewports.delete(p.context);
+      this._prompts.delete(p.context);
     });
-    conn.on('browsingContext.userPromptOpened', (p) => { this.pendingPrompt = p; });
+    // A blocking dialog belongs to one tab; answering another tab's dialog
+    // must not silently consume it.
+    conn.on('browsingContext.userPromptOpened', (p) => { this._prompts.set(p.context, p); });
+    conn.on('browsingContext.userPromptClosed', (p) => { this._prompts.delete(p.context); });
     // A fresh document drops the page-side ref store.
     conn.on('browsingContext.load', (p) => this._booted.delete(p.context));
   }
@@ -294,6 +312,7 @@ class Session {
     for (const context of [...this.tabs.byContext.keys()]) {
       if (!live.has(context)) this.tabs.remove(context);
     }
+    this.adoptOpenedTabs(contexts);
     const out = [];
     for (const c of contexts) {
       const tabId = this.tabs.tabIdFor(c.context);
@@ -301,6 +320,31 @@ class Session {
       out.push({ tabId, context: c.context, url: c.url, clientWindow: c.clientWindow });
     }
     return out;
+  }
+
+  // target=_blank links, window.open and OAuth popups create top-level
+  // contexts of their own. A tab opened by one of ours belongs to the group;
+  // a tab the user opened by hand does not.
+  adoptOpenedTabs(contexts) {
+    const byContext = new Map(contexts.map((c) => [c.context, c]));
+    let added = true;
+    while (added) {
+      added = false;
+      for (const info of contexts) {
+        if (this.tabs.tabIdFor(info.context) !== undefined) continue;
+        let opener = info.originalOpener;
+        const seen = new Set();
+        while (opener && !seen.has(opener)) {
+          if (this.tabs.tabIdFor(opener) !== undefined) {
+            this.tabs.add(info.context);
+            added = true;
+            break;
+          }
+          seen.add(opener);
+          opener = byContext.get(opener)?.originalOpener;
+        }
+      }
+    }
   }
 
   async createTab({ type, url } = {}) {
@@ -359,16 +403,26 @@ class Session {
 
   async applyViewport(context) {
     if (!this.viewportSize || this._sized.has(context)) return;
-    this._sized.add(context);
     try {
       await this.conn.send('browsingContext.setViewport', {
         context,
         viewport: { width: this.viewportSize.width, height: this.viewportSize.height },
         devicePixelRatio: 1,
       });
+      this._sized.add(context);
+      this._viewports.set(context, { ...this.viewportSize });
     } catch (err) {
+      // A tab that was still navigating can reject this; leave it unmarked so
+      // the next call retries instead of silently running at the window size.
       this.lastViewportError = err.message;
     }
+  }
+
+  // The size that tab is actually rendering at, for screenshot labels and
+  // zoom bounds. Tabs keep their own size once resize_window touches one.
+  viewportFor(tabId) {
+    const context = this.tabs.contextFor(tabId);
+    return (context && this._viewports.get(context)) || this.viewportSize;
   }
 
   async setViewport(tabId, { width, height, devicePixelRatio = 1 }) {
@@ -378,9 +432,10 @@ class Session {
       viewport: { width: Math.round(width), height: Math.round(height) },
       devicePixelRatio,
     });
-    this.viewportSize = { width: Math.round(width), height: Math.round(height) };
+    const size = { width: Math.round(width), height: Math.round(height) };
+    this._viewports.set(context, size);
     this._sized.add(context);
-    return this.viewportSize;
+    return size;
   }
 
   async callFunction(tabId, functionDeclaration, args = [], { timeout = 30000, ownership = 'none', awaitPromise = true } = {}) {
@@ -467,12 +522,28 @@ class Session {
     return this.conn.send('input.performActions', { context: this.requireContext(tabId), actions });
   }
 
+  // The tab currently blocked by a dialog, if we saw it open.
+  promptTabId() {
+    for (const context of this._prompts.keys()) {
+      const tabId = this.tabs.tabIdFor(context);
+      if (tabId !== undefined) return tabId;
+    }
+    return null;
+  }
+
   async handleUserPrompt(tabId, accept = true, userText) {
-    const params = { context: this.requireContext(tabId), accept };
+    const context = this.requireContext(tabId);
+    const params = { context, accept };
     if (userText !== undefined) params.userText = String(userText);
-    await this.conn.send('browsingContext.handleUserPrompt', params);
-    const prompt = this.pendingPrompt;
-    this.pendingPrompt = null;
+    try {
+      await this.conn.send('browsingContext.handleUserPrompt', params);
+    } catch (err) {
+      if (err.code !== 'no such alert') throw err;
+      this._prompts.delete(context);
+      return null;
+    }
+    const prompt = this._prompts.get(context) || null;
+    this._prompts.delete(context);
     return prompt;
   }
 

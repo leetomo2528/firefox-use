@@ -98,7 +98,9 @@ class BidiConnection extends EventEmitter {
   }
 
   close() {
-    this._closed = true;
+    // Reject what is still in flight first: a caller waiting on a 90s
+    // screenshot would otherwise hang until its own timeout.
+    this._onClose(new Error('BiDi connection is closed'));
     this._ws.close();
   }
 }

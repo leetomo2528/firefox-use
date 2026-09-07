@@ -9,6 +9,7 @@
 // simply not there.
 
 const { fromRemoteValue } = require('./session');
+const { matchIndices } = require('./safe-regex');
 
 const NETWORK_EVENTS = ['network.beforeRequestSent', 'network.responseCompleted', 'network.fetchError'];
 const BUFFER_LIMIT = 1000;
@@ -398,9 +399,17 @@ async function readConsoleMessages(session, { tabId, onlyErrors = false, clear =
 
   const total = buf.console.length;
   // Text or level, kept apart so an anchored pattern ('^MyApp') still matches
-  // the message while 'error|warning' still matches the level.
-  const matched = buf.console.filter((e) =>
-    (!onlyErrors || isErrorLevel(e.level)) && (!re || re.test(e.text) || re.test(e.level)));
+  // the message while 'error|warning' still matches the level. Matching runs
+  // under a time budget: the pattern comes from the model.
+  let hits = null;
+  if (re) {
+    const texts = buf.console.map((e) => String(e.text || ''));
+    const levels = buf.console.map((e) => String(e.level || ''));
+    const found = await matchIndices(pattern, [...texts, ...levels]);
+    hits = new Set(found.map((i) => i % Math.max(texts.length, 1)));
+  }
+  const matched = buf.console.filter((e, i) =>
+    (!onlyErrors || isErrorLevel(e.level)) && (!hits || hits.has(i)));
   const cap = normalizeLimit(limit);
   const shown = matched.slice(-cap);
   const filteredOut = total - matched.length;

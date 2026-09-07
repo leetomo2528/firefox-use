@@ -168,3 +168,113 @@ test('page scripts are ASCII and parse as functions', () => {
     assert.equal(typeof new Function(`return ${src}`)(), 'function', name);
   }
 });
+
+// --- regressions found by the parity review ------------------------------
+
+test('a tab the page opens itself joins the group', async () => {
+  const { session, conn } = sessionWith();
+  await session.adoptExistingTabs();
+  // target=_blank / window.open: Firefox creates a second top-level context.
+  conn.replies['browsingContext.getTree'] = {
+    contexts: [
+      { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+      { context: 'ctx-popup', url: 'https://oauth.test/', clientWindow: 'win-1', originalOpener: 'ctx-a' },
+    ],
+  };
+  const tabs = await session.listTabs();
+  assert.equal(tabs.length, 2, 'the popup is reachable');
+  assert.ok(tabs.some((t) => t.url === 'https://oauth.test/'));
+});
+
+test('a tab the user opened by hand stays out of the group', async () => {
+  const { session, conn } = sessionWith();
+  await session.adoptExistingTabs();
+  conn.replies['browsingContext.getTree'] = {
+    contexts: [
+      { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+      { context: 'ctx-user', url: 'https://mail.test/', clientWindow: 'win-2', originalOpener: null },
+    ],
+  };
+  const tabs = await session.listTabs();
+  assert.deepEqual(tabs.map((t) => t.url), ['https://a.test/'], 'only our own tabs are listed');
+});
+
+test('a popup opened by a popup is adopted too', async () => {
+  const { session, conn } = sessionWith();
+  await session.adoptExistingTabs();
+  conn.replies['browsingContext.getTree'] = {
+    contexts: [
+      { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+      { context: 'ctx-1', url: 'https://one.test/', originalOpener: 'ctx-a' },
+      { context: 'ctx-2', url: 'https://two.test/', originalOpener: 'ctx-1' },
+    ],
+  };
+  assert.equal((await session.listTabs()).length, 3);
+});
+
+test('each tab keeps its own viewport size', async () => {
+  const { session, conn } = sessionWith({
+    'browsingContext.getTree': {
+      contexts: [
+        { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+        { context: 'ctx-b', url: 'https://b.test/', clientWindow: 'win-1' },
+      ],
+    },
+  });
+  await session.adoptExistingTabs();
+  await session.setViewport(1, { width: 400, height: 600 });
+  assert.deepEqual(session.viewportFor(1), { width: 400, height: 600 });
+  assert.deepEqual(session.viewportFor(2), { width: 1280, height: 800 }, 'the other tab is untouched');
+  void conn;
+});
+
+test('a viewport that failed to apply is retried, not written off', async () => {
+  let calls = 0;
+  const { session, conn } = sessionWith({
+    'browsingContext.setViewport': () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error('no such frame'), { code: 'no such frame' });
+      return {};
+    },
+    'script.evaluate': { type: 'success', result: { type: 'number', value: 1 } },
+  });
+  await session.adoptExistingTabs();
+  await session.applyViewport('ctx-a');
+  await session.applyViewport('ctx-a');
+  assert.equal(calls, 2, 'the transient failure is retried');
+  void conn;
+});
+
+test('a dialog is answered on the tab that opened it', async () => {
+  const { session, conn } = sessionWith({
+    'browsingContext.getTree': {
+      contexts: [
+        { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+        { context: 'ctx-b', url: 'https://b.test/', clientWindow: 'win-1' },
+      ],
+    },
+  });
+  await session.adoptExistingTabs();
+  conn.emit('browsingContext.userPromptOpened', { context: 'ctx-b', type: 'confirm', message: 'really?' });
+  assert.equal(session.promptTabId(), 2, 'the session knows which tab is blocked');
+  const handled = await session.handleUserPrompt(2, true);
+  assert.equal(conn.lastOf('browsingContext.handleUserPrompt').params.context, 'ctx-b');
+  assert.equal(handled.message, 'really?');
+  assert.equal(session.promptTabId(), null, 'cleared after handling');
+});
+
+test('a prompt on another tab is not consumed by the wrong answer', async () => {
+  const { session, conn } = sessionWith({
+    'browsingContext.getTree': {
+      contexts: [
+        { context: 'ctx-a', url: 'https://a.test/', clientWindow: 'win-1' },
+        { context: 'ctx-b', url: 'https://b.test/', clientWindow: 'win-1' },
+      ],
+    },
+  });
+  await session.adoptExistingTabs();
+  conn.emit('browsingContext.userPromptOpened', { context: 'ctx-b', type: 'alert', message: 'from b' });
+  const handled = await session.handleUserPrompt(1, true);
+  assert.equal(handled, null, 'tab 1 had no dialog of its own');
+  assert.equal(session.promptTabId(), 2, "tab 2's dialog is still open");
+});

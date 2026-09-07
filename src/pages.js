@@ -98,10 +98,20 @@ const FORM_INPUT_FN = `(function (ref, value) {
   }
 
   if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
-    assign(el, 'checked', truthy(value));
-    fire(el);
+    var want = truthy(value);
+    // React and friends listen for click on checkboxes, not input/change, so a
+    // native-setter write leaves their state stale. Toggle it the way a person
+    // would, and fall back to the setter if the click was intercepted.
+    if (el.checked !== want && typeof el.click === 'function') {
+      try { el.click(); } catch (e) { /* fall through to the setter */ }
+    }
+    if (el.checked !== want) {
+      assign(el, 'checked', want);
+      fire(el);
+    }
     result.kind = type;
     result.value = el.checked === true;
+    if (el.checked !== want) return fail('the page reset the control after it was set');
     return JSON.stringify(result);
   }
 

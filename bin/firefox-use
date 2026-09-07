@@ -11,15 +11,9 @@ const { McpServer } = require('../src/mcp');
 const { Session } = require('../src/session');
 const pkg = require('../package.json');
 
-const args = process.argv.slice(2);
-const command = args[0] && !args[0].startsWith('-') ? args.shift() : 'mcp';
+const { parseArgs } = require('../src/cliargs');
 
-function flag(name) {
-  const i = args.indexOf(`--${name}`);
-  if (i === -1) return undefined;
-  const next = args[i + 1];
-  return next && !next.startsWith('--') ? next : true;
-}
+const { command, flag, positionals } = parseArgs(process.argv.slice(2));
 
 const options = {
   headless: flag('headless') === true || process.env.FIREFOX_USE_HEADLESS === '1',
@@ -50,7 +44,9 @@ Options:
 `;
 
 async function withSession(fn) {
-  const session = await Session.open(options);
+  // autoRestart is for the MCP server, which owns the browser. A CLI command
+  // that met someone else's session must not kill their Firefox.
+  const session = await Session.open({ ...options, autoRestart: false });
   try {
     return await fn(session);
   } finally {
@@ -75,7 +71,7 @@ async function main() {
     }
 
     case 'start': {
-      const url = args.find((a) => !a.startsWith('--'));
+      const url = positionals[0];
       const state = await launcher.ensureRunning({ ...options, url });
       console.log(`Firefox ${state.launched ? 'started' : 'already running'}: pid ${state.pid}, port ${state.port}`);
       console.log(`profile: ${state.profile}`);
@@ -111,7 +107,7 @@ async function main() {
     }
 
     case 'open': {
-      const url = args.find((a) => !a.startsWith('--'));
+      const url = positionals[0];
       if (!url) throw new Error('usage: firefox-use open <url>');
       await withSession(async (session) => {
         const tabId = await session.defaultTabId();
@@ -123,7 +119,7 @@ async function main() {
     }
 
     case 'shot': {
-      const positional = args.filter((a) => !a.startsWith('--'));
+      const positional = positionals;
       const file = positional[0];
       if (!file) throw new Error('usage: firefox-use shot <file.png> [url]');
       await withSession(async (session) => {
