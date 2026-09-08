@@ -1,14 +1,35 @@
 ---
 name: claude-in-firefox
-description: Automates your Firefox browser to interact with web pages - clicking elements, filling forms, capturing screenshots, reading console logs, and navigating sites. Opens pages in new tabs inside a dedicated firefox-use profile driven over WebDriver BiDi. - When the user wants to interact with web pages, automate browser tasks, capture screenshots, read console logs, or perform any browser-based actions. Always invoke BEFORE attempting to use any mcp__claude-in-firefox__* tools.
+description: Drive the user's Firefox to do anything on the web - open sites, log in, fill and submit forms, click through an app, capture screenshots, scrape page content, upload files, watch console and network traffic, record a GIF of a flow. This is the DEFAULT way to operate a browser or a web page on this machine (the Chrome integration is not set up here), so use it for any request that means "open/check/test/log into/click/screenshot a site or a local dev server", including Korean phrasing such as 브라우저, 웹사이트 열어/확인해, 로그인, 폼 입력, 스크린샷, 크롤링, 사이트 테스트. Invoke this skill BEFORE calling any mcp__claude-in-firefox__* tool.
 ---
 
 # Claude in Firefox
 
-firefox-use gives you the same browser tool surface as the Chrome integration, driving
-Firefox instead. `firefox-use install` registers the server as `claude-in-firefox`, so the
-tools read as `mcp__claude-in-firefox__computer` and so on - one word away from Chrome's.
-If your tool list shows a different prefix, the part after it is still the tool name used here.
+firefox-use gives you the same browser tool surface as Claude Code's Chrome integration,
+driving Firefox instead. The server is registered as `claude-in-firefox`, so the tools read
+as `mcp__claude-in-firefox__computer` and so on - one word away from Chrome's. If your tool
+list shows a different prefix, the part after it is still the tool name used here.
+
+## Use this for anything that needs a browser
+
+This machine has no Chrome integration, so these tools are how you touch the web when the
+task needs a real browser: opening a page for the user, logging into a site, filling and
+submitting a form, clicking through an app, taking a screenshot of a layout, reading a page
+that needs JavaScript to render, checking a local dev server, uploading a file, watching
+console errors or network calls, or recording a GIF of a flow.
+
+Reach for something else only when a browser is not what the task needs: `curl`/WebFetch for
+a plain document or API response, and the file system or shell for local work. Do not write
+one-off Playwright/Puppeteer/Selenium scripts for these tasks - the tools here already drive
+a real, logged-in browser and cost nothing to start.
+
+Firefox launches on the first tool call. It uses a dedicated profile at
+`~/.firefox-use/profile`, so sessions the user logs into there persist between tasks, and
+their everyday browser is never touched. The user can stop it any time with
+`firefox-use stop`.
+
+These tools control the browser only. Anything outside the Firefox window - other apps,
+Finder, system settings - is not reachable from here; say so instead of pretending.
 
 ## Tab context and session startup
 
