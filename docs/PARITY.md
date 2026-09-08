@@ -1,9 +1,11 @@
 # Parity target: Claude in Chrome
 
-`docs/chrome-tool-spec.json` is the verbatim tool surface of Claude Code's Chrome
-integration (`mcp__claude-in-chrome__*`), extracted from the Claude Code 2.1.263
-bundle. firefox-use implements the same tool names, schemas and semantics against
-Firefox so a browser task runs identically on either browser.
+firefox-use implements the same tool names and parameter shapes as Claude Code's
+Chrome integration (`mcp__claude-in-chrome__*`), so a browser task runs the same on
+either browser. The reference used by the tests is generated locally with
+`npm run spec`, which reads the definitions out of your own Claude Code install into
+`.spec/chrome-tool-spec.json`; it is never committed, and the wording of our own
+descriptions is ours (see NOTICE).
 
 ## Implemented (17)
 

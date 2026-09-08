@@ -11,8 +11,8 @@ async function readPage(session, { tabId, filter, depth, ref_id, max_chars }) { 
 
 function tools(ctx) {
   return [{
-    name: 'read_page',                    // EXACT name from docs/chrome-tool-spec.json
-    description: '...',                   // copy the spec description verbatim; only swap Chrome->Firefox naming
+    name: 'read_page',                    // EXACT name from .spec/chrome-tool-spec.json
+    description: '...',                   // our own wording; must state every default and limit the schema declares
     inputSchema: { /* copy verbatim */ },
     handler: async (args) => {
       const session = await ctx.session();
@@ -75,4 +75,7 @@ Page-side ref store: `window.__ffuse = { refs: Map<string, Element>, next: numbe
    `package.json`, `README.md`, or another module's files.
 3. Keep source ASCII: write ``-style escapes, never raw control or non-ASCII characters.
 4. No npm dependencies. Node built-ins only (`zlib` is available and useful for GIF/PNG work).
-5. Copy names, descriptions and schemas from `docs/chrome-tool-spec.json` exactly.
+5. Names and schemas come from `.spec/chrome-tool-spec.json` (generate it with `npm run spec`)
+   and must match it exactly - property names, types, enums, `required`, minimum/maximum.
+   **Descriptions are written here, in our own words.** Never copy the reference prose:
+   `test/prose.test.js` fails on any run of ~50 characters shared with it.

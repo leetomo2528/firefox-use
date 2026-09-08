@@ -1,10 +1,18 @@
 'use strict';
-// Parity acceptance: our tools must match the Chrome integration's definitions.
-// docs/chrome-tool-spec.json is the verbatim Chrome surface extracted from the
-// Claude Code bundle.
+// Parity acceptance: our tool surface must line up with Claude Code's Chrome
+// integration, tool for tool and parameter for parameter.
+//
+// The reference is generated from YOUR OWN Claude Code install and stays local:
+//   npm run spec      (writes .spec/chrome-tool-spec.json)
+// Without it these checks skip; the unit and live suites do not need it.
 const test = require('node:test');
 const assert = require('node:assert');
-const SPEC = require('../docs/chrome-tool-spec.json');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skip = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
 
 // Chrome extension / side-panel features with no Firefox counterpart.
 const NOT_APPLICABLE = new Set([
@@ -19,24 +27,8 @@ function ours() {
   return new Map(host.tools().map((t) => [t.name, t]));
 }
 
-function normalize(text) {
-  return String(text)
-    .toLowerCase()
-    .replace(/chrome|firefox|browser extension|the extension/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-function overlap(a, b) {
-  const A = new Set(normalize(a).split(' ').filter((w) => w.length > 3));
-  const B = new Set(normalize(b).split(' ').filter((w) => w.length > 3));
-  if (!A.size || !B.size) return 0;
-  let shared = 0;
-  for (const w of A) if (B.has(w)) shared++;
-  return shared / A.size;
-}
-
-// Compares JSON Schema structure while allowing prose (description) to differ.
+// Compares JSON Schema structure while leaving prose free: the wording here is
+// our own, the shape is what has to interoperate.
 function schemaShape(schema) {
   if (!schema || typeof schema !== 'object') return schema;
   if (Array.isArray(schema)) return schema.map(schemaShape);
@@ -48,56 +40,84 @@ function schemaShape(schema) {
   return out;
 }
 
-const implemented = SPEC.filter((t) => !NOT_APPLICABLE.has(t.name));
+const implemented = () => SPEC.filter((t) => !NOT_APPLICABLE.has(t.name));
 
-test('every applicable Chrome tool exists here', () => {
+test('every applicable Chrome tool exists here', { skip }, () => {
   const mine = ours();
-  const missing = implemented.map((t) => t.name).filter((name) => !mine.has(name));
+  const missing = implemented().map((t) => t.name).filter((name) => !mine.has(name));
   assert.deepEqual(missing, [], `missing tools: ${missing.join(', ')}`);
 });
 
-test('no unexpected extra tools', () => {
+test('no unexpected extra tools', { skip }, () => {
   const mine = ours();
   const specNames = new Set(SPEC.map((t) => t.name));
   const extras = [...mine.keys()].filter((name) => !specNames.has(name) && !EXTRAS.has(name));
   assert.deepEqual(extras, [], `unexpected tools: ${extras.join(', ')}`);
 });
 
-for (const spec of implemented) {
-  test(`${spec.name}: input schema matches the Chrome definition`, () => {
-    const mine = ours().get(spec.name);
-    assert.ok(mine, `${spec.name} is missing`);
+test('input schemas match the Chrome definitions', { skip }, () => {
+  const mine = ours();
+  for (const spec of implemented()) {
+    const tool = mine.get(spec.name);
+    assert.ok(tool, `${spec.name} is missing`);
     assert.deepEqual(
-      schemaShape(mine.inputSchema),
+      schemaShape(tool.inputSchema),
       schemaShape(spec.inputSchema),
-      `${spec.name} schema differs (properties, enums, required, limits must match)`
+      `${spec.name}: properties, enums, required and limits must match`
     );
-  });
+  }
+});
 
-  test(`${spec.name}: every parameter is documented`, () => {
-    const mine = ours().get(spec.name);
+test('every documented parameter is documented here too', { skip }, () => {
+  const mine = ours();
+  for (const spec of implemented()) {
+    const tool = mine.get(spec.name);
     for (const [prop, def] of Object.entries(spec.inputSchema.properties || {})) {
-      const ourProp = mine.inputSchema.properties[prop];
+      const ourProp = tool.inputSchema.properties[prop];
       assert.ok(ourProp, `${spec.name}.${prop} missing`);
-      if (def.description) {
-        assert.ok(
-          typeof ourProp.description === 'string' && ourProp.description.length > 0,
-          `${spec.name}.${prop} needs a description`
-        );
-      }
+      if (!def.description) continue;
+      assert.ok(
+        typeof ourProp.description === 'string' && ourProp.description.trim().length >= 10,
+        `${spec.name}.${prop} needs a description of its own`
+      );
     }
-  });
+  }
+});
 
-  test(`${spec.name}: description says the same thing`, () => {
-    const mine = ours().get(spec.name);
-    const score = overlap(spec.description, mine.description);
-    assert.ok(score >= 0.5, `${spec.name} description drifted from the Chrome wording (overlap ${score.toFixed(2)})`);
-  });
-}
+// The descriptions are written here, not copied: Anthropic's wording is theirs.
+test('tool prose is our own, and says enough to use the tool', { skip }, () => {
+  const mine = ours();
+  for (const spec of implemented()) {
+    const tool = mine.get(spec.name);
+    assert.notEqual(
+      tool.description.trim(), spec.description.trim(),
+      `${spec.name}: the description is copied verbatim from Claude Code - write it in our own words`
+    );
+    assert.ok(tool.description.trim().length >= 60, `${spec.name}: description is too thin to be useful`);
+    for (const [prop, def] of Object.entries(spec.inputSchema.properties || {})) {
+      if (!def.description || !tool.inputSchema.properties[prop]?.description) continue;
+      assert.notEqual(
+        tool.inputSchema.properties[prop].description.trim(), def.description.trim(),
+        `${spec.name}.${prop}: parameter text is copied verbatim - rewrite it`
+      );
+    }
+  }
+});
 
-test('handlers are wired for every tool', () => {
+// These hold with or without the reference file.
+test('every tool is wired and well formed', () => {
   for (const [name, tool] of ours()) {
     assert.equal(typeof tool.handler, 'function', `${name} has no handler`);
     assert.equal(tool.inputSchema.type, 'object', `${name} schema must be an object`);
+    assert.ok(tool.description && tool.description.length > 20, `${name} needs a description`);
+    for (const required of tool.inputSchema.required || []) {
+      assert.ok(tool.inputSchema.properties[required], `${name} requires undeclared "${required}"`);
+    }
   }
+});
+
+test('the surface is the one we document', () => {
+  const names = [...ours().keys()].sort();
+  assert.equal(names.length, 20, `expected 17 parity tools plus 3 Firefox-only ones, got ${names.length}`);
+  for (const extra of EXTRAS) assert.ok(names.includes(extra), `${extra} is missing`);
 });

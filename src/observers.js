@@ -486,39 +486,66 @@ function buffersFor(session, tabId) {
   return bufferFor(stateFor(session), Number(tabId));
 }
 
-// --- tool definitions (verbatim from docs/chrome-tool-spec.json) ----------
+// --- tool definitions -----------------------------------------------------
+//
+// Names, types, enums, required[] and limits are the Chrome contract, so a task
+// written for one browser runs on the other. The prose is ours.
 
 function tools(ctx) {
   return [
     {
       name: 'read_console_messages',
       description:
-        "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. " +
-        "Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. " +
-        "Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. " +
-        "IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
+        'Hand back the console output firefox-use has buffered for one tab: log, info, warn and error '
+        + 'entries, plus uncaught page exceptions with their stack frames. Every line arrives as an ISO '
+        + 'timestamp, the level in brackets and the text, oldest first, and an error also shows the frame it '
+        + 'was thrown from. Capture is lazy - the buffer only starts filling the first time you call this '
+        + 'tool or read_network_requests in a session, so anything printed before that was never seen; '
+        + 'reload and read again. A tab keeps its 1000 most recent entries, and the whole log is dropped '
+        + 'when that tab moves to a different origin (a new scheme, host or port each count), so read '
+        + 'before you send the page somewhere else; the reply says so when either of those cost you '
+        + 'entries. tabId is the only required argument and has to name a tab this session owns - '
+        + 'tabs_context_mcp lists them. Send a pattern nearly every time: on a talkative app an unfiltered '
+        + 'read buries the two lines you were after.',
       inputSchema: {
         type: 'object',
         properties: {
           tabId: {
             type: 'number',
-            description: "Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            description:
+              'Numeric id of the tab to read, as reported by tabs_context_mcp or tabs_create_mcp. It must be '
+              + 'one of the tabs in this session\'s group, and it is required - leave it out and the call '
+              + 'errors instead of guessing which tab you meant.',
           },
           onlyErrors: {
             type: 'boolean',
-            description: 'If true, only return error and exception messages. Default is false (return all message types).',
+            description:
+              'Set true to keep just the severe entries - console.error, console.assert, anything logged at '
+              + 'severe or critical, and uncaught exceptions - and discard info, log and warn. Omitted it is '
+              + 'false, and every level comes through.',
           },
           clear: {
             type: 'boolean',
-            description: 'If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false.',
+            description:
+              'Set true to empty this tab\'s console buffer once the reply has been assembled, so your next '
+              + 'read shows only what arrived after this one. False by default, which means the same lines '
+              + 'will be reported again.',
           },
           pattern: {
             type: 'string',
-            description: "Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages.",
+            description:
+              'A JavaScript regular expression, applied case-insensitively. An entry survives when the '
+              + 'expression hits either its text or its level, so \'warn|error\' selects by severity while '
+              + '\'CheckoutForm\' selects by content. A malformed expression comes back as an error rather '
+              + 'than being quietly ignored, and so does one that backtracks past the one-second matching '
+              + 'budget - drop the nested quantifiers if that happens. Optional, but give one whenever you '
+              + 'can narrow the search: it is the difference between the lines you need and a wall of noise.',
           },
           limit: {
             type: 'number',
-            description: 'Maximum number of messages to return. Defaults to 100. Increase only if you need more results.',
+            description:
+              'Ceiling on how many matching entries come back, newest kept. 100 when omitted. The header '
+              + 'counts any matches this cap held back, so raise it once you see that it actually bit.',
           },
         },
         required: ['tabId'],
@@ -531,28 +558,43 @@ function tools(ctx) {
     {
       name: 'read_network_requests',
       description:
-        'Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. ' +
-        'Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. ' +
-        'Returns all network requests made by the current page, including cross-origin requests. ' +
-        "Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+        'List the HTTP traffic recorded for one tab - documents, scripts, stylesheets, images, XHR and fetch '
+        + 'alike - as one padded row per request, oldest first, giving method, status, resource type, '
+        + 'elapsed time, bytes transferred and URL, flagged when the request failed or is still in flight. '
+        + 'Use it to confirm an API call actually fired, see what came back, or find the asset costing you '
+        + 'seconds. Traffic to any host is kept, not only the page\'s own origin, but a tab\'s log is emptied '
+        + 'as soon as that tab moves to a different origin (scheme, host or port), and only its 1000 most '
+        + 'recent requests survive. Recording begins with your first call to this tool or '
+        + 'read_console_messages, so a request made earlier than that does not exist here; reload and read '
+        + 'again. tabId is required and has to be a tab in this session\'s group - tabs_context_mcp will give '
+        + 'you one.',
       inputSchema: {
         type: 'object',
         properties: {
           tabId: {
             type: 'number',
-            description: "Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            description:
+              'The tab whose requests you want, as the numeric id from tabs_context_mcp. Traffic is buffered '
+              + 'per tab, and only tabs belonging to this session can be read.',
           },
           urlPattern: {
             type: 'string',
-            description: "Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain).",
+            description:
+              'A plain substring, matched case-insensitively against the whole URL: \'/api/\' isolates API '
+              + 'traffic, \'fonts.\' one host\'s assets. Literal text, not a regular expression - dots and '
+              + 'slashes stand for themselves. Leave it off and every recorded request comes back.',
           },
           clear: {
             type: 'boolean',
-            description: 'If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false.',
+            description:
+              'Set true to discard this tab\'s recorded requests after the reply is built, so a later read '
+              + 'starts from empty instead of repeating what you have already looked at. Defaults to false.',
           },
           limit: {
             type: 'number',
-            description: 'Maximum number of requests to return. Defaults to 100. Increase only if you need more results.',
+            description:
+              'Largest number of matching requests to return, most recent kept; 100 unless you say otherwise. '
+              + 'The header reports how many matches the cap hid, which is your cue to ask for more.',
           },
         },
         required: ['tabId'],

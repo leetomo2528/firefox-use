@@ -2,13 +2,32 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
+const nodeFs = require('node:fs');
 const { FakeSession, fakeCtx } = require('./helpers/fake-session');
 const {
   GifRecorder, tools, mergeOptions, paletteSize, ditherFor, overlayOps, frameDelay, safeFilename,
   cleanLabel, CLICKS_FN, DEFAULTS,
 } = require('../src/gif');
 
-const SPEC = require('../docs/chrome-tool-spec.json').find((t) => t.name === 'gif_creator');
+// The Chrome reference is generated locally (npm run spec) and never committed,
+// so these checks stand down when it is absent - see test/parity.test.js.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = nodeFs.existsSync(SPEC_PATH)
+  ? JSON.parse(nodeFs.readFileSync(SPEC_PATH, 'utf8')).find((t) => t.name === 'gif_creator')
+  : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+// Structure is what has to interoperate with Chrome; the prose is ours.
+function schemaShape(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key !== 'description') out[key] = schemaShape(value);
+  }
+  return out;
+}
+
 const DIR = '/tmp/ffuse-test';
 
 // A hand-cranked timer queue: the capture loop advances only when a test says so.
@@ -83,15 +102,51 @@ function setup({ session, gifenc, ...opts } = {}) {
   return { recorder, clock, enc, fs, session: s };
 }
 
-test('the tool definition matches the Chrome spec', () => {
+test('the tool definition keeps the Chrome schema shape', { skip: skipSpec }, () => {
   const [def] = tools(fakeCtx(new FakeSession()));
   assert.equal(def.name, 'gif_creator');
-  assert.deepStrictEqual(def.inputSchema, SPEC.inputSchema);
-  // Everything up to the Chrome-only drop-target sentence is verbatim.
-  assert.ok(def.description.startsWith(SPEC.description.split('For export,')[0]));
-  assert.ok(!/coordinate/.test(def.description), 'the extension drop target has no Firefox equivalent');
-  assert.match(def.description, /download: true/);
+  // Names, types, enum values, required and the nested options object all have
+  // to line up; only the description strings are allowed to differ.
+  assert.deepStrictEqual(schemaShape(def.inputSchema), schemaShape(SPEC.inputSchema));
+});
+
+test('the prose is written here, not copied from Chrome', { skip: skipSpec }, () => {
+  const [def] = tools(fakeCtx(new FakeSession()));
+  assert.notEqual(def.description.trim(), SPEC.description.trim(), 'tool description is verbatim');
+  const theirs = SPEC.inputSchema.properties;
+  for (const [prop, ours] of Object.entries(def.inputSchema.properties)) {
+    if (!theirs[prop] || !theirs[prop].description) continue;
+    assert.notEqual(ours.description.trim(), theirs[prop].description.trim(), `${prop} is verbatim`);
+    for (const [sub, mine] of Object.entries(ours.properties || {})) {
+      const yours = (theirs[prop].properties || {})[sub];
+      if (!yours || !yours.description) continue;
+      assert.notEqual(mine.description.trim(), yours.description.trim(), `${prop}.${sub} is verbatim`);
+    }
+  }
+});
+
+// Holds with or without the reference file: what the tool has to say for itself.
+test('the definition is wired up and documents the tool', () => {
+  const [def] = tools(fakeCtx(new FakeSession()));
+  assert.equal(def.name, 'gif_creator');
   assert.equal(typeof def.handler, 'function');
+  assert.equal(typeof def.description, 'string');
+  // The extension's drag & drop export target has no Firefox counterpart.
+  assert.ok(!/coordinate/.test(def.description), 'no drop-target export here');
+  // Every number the schema fixes has to appear in the prose that goes with it.
+  assert.match(def.description, /700 ?ms/);
+  assert.match(def.description, /120/);
+  assert.match(def.description, /800/);
+  const opts = def.inputSchema.properties.options;
+  assert.match(opts.description, /1 to 30/);
+  assert.match(opts.description, /\b10\b/);
+  assert.match(opts.properties.quality.description, /1 to 30/);
+  for (const flag of ['showClickIndicators', 'showDragPaths', 'showActionLabels', 'showProgressBar', 'showWatermark']) {
+    assert.match(opts.properties[flag].description, /false/, `${flag} says what its default is`);
+  }
+  for (const prop of Object.keys(def.inputSchema.properties)) {
+    assert.ok(def.inputSchema.properties[prop].description.length >= 10, `${prop} needs a description`);
+  }
 });
 
 test('start_recording captures the first frame at once and arms the loop', async () => {

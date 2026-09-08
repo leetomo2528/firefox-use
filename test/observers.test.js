@@ -4,7 +4,26 @@ const assert = require('node:assert');
 const { FakeSession, fakeCtx } = require('./helpers/fake-session');
 const observers = require('../src/observers');
 const { attach, readConsoleMessages, readNetworkRequests, buffersFor, tools, BUFFER_LIMIT } = observers;
-const spec = require('../docs/chrome-tool-spec.json');
+const fs = require('node:fs');
+const path = require('node:path');
+
+// The Chrome reference is generated locally by `npm run spec` and never committed,
+// so these checks skip when it is absent. See test/parity.test.js.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+// Schema shape without any prose: the structure interoperates, the wording is ours.
+function schemaShape(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description') continue;
+    out[key] = schemaShape(value);
+  }
+  return out;
+}
 
 const TABS = [
   { tabId: 1, context: 'ctx-1', url: 'https://example.com/' },
@@ -37,15 +56,52 @@ function respond(session, { context = 'ctx-1', id = 'req-1', status = 200, statu
   });
 }
 
-test('tool definitions match the Chrome spec verbatim', () => {
+test('both observer tools are declared and wired', () => {
   const defs = tools(fakeCtx(new FakeSession()));
   assert.deepEqual(defs.map((d) => d.name), ['read_console_messages', 'read_network_requests']);
   for (const def of defs) {
-    const target = spec.find((t) => t.name === def.name);
-    assert.ok(target, `${def.name} missing from the spec`);
-    assert.equal(def.description, target.description);
-    assert.deepEqual(def.inputSchema, target.inputSchema);
     assert.equal(typeof def.handler, 'function');
+    assert.equal(def.inputSchema.type, 'object');
+    assert.deepEqual(def.inputSchema.required, ['tabId']);
+    assert.ok(def.description.length >= 60, `${def.name}: description is too thin to be useful`);
+    for (const [prop, def_] of Object.entries(def.inputSchema.properties)) {
+      assert.ok(
+        typeof def_.description === 'string' && def_.description.trim().length >= 10,
+        `${def.name}.${prop} needs a description of its own`
+      );
+    }
+  }
+});
+
+test('the observer schemas keep the Chrome shape', { skip: skipSpec }, () => {
+  const defs = tools(fakeCtx(new FakeSession()));
+  for (const def of defs) {
+    const target = SPEC.find((t) => t.name === def.name);
+    assert.ok(target, `${def.name} missing from the reference`);
+    assert.deepEqual(
+      schemaShape(def.inputSchema),
+      schemaShape(target.inputSchema),
+      `${def.name}: properties, types, enums, required and limits must match`
+    );
+  }
+});
+
+// Anthropic's wording stays Anthropic's; ours has to be written here.
+test('the observer prose is our own', { skip: skipSpec }, () => {
+  const defs = tools(fakeCtx(new FakeSession()));
+  for (const def of defs) {
+    const target = SPEC.find((t) => t.name === def.name);
+    assert.notEqual(
+      def.description.trim(), target.description.trim(),
+      `${def.name}: the description is copied verbatim - write it in our own words`
+    );
+    for (const [prop, ref] of Object.entries(target.inputSchema.properties || {})) {
+      if (!ref.description) continue;
+      assert.notEqual(
+        def.inputSchema.properties[prop].description.trim(), ref.description.trim(),
+        `${def.name}.${prop}: parameter text is copied verbatim - rewrite it`
+      );
+    }
   }
 });
 
@@ -172,9 +228,9 @@ test('a response with no request of its own has an unknown duration', async () =
   assert.match(await readNetworkRequests(session, { tabId: 1 }), /200\s+\w+\s+-\s+12 B https:\/\/example\.com\/inflight\.json/);
 });
 
-// Both tool descriptions scope their log to the page's domain: the network one
-// says requests are cleared on a cross-domain navigation, the console one says
-// it returns "messages from the current domain only".
+// Both tool descriptions promise the same scoping: a tab's console and network
+// logs are emptied when it moves to another origin, and survive a hop inside
+// the one it is already on.
 test('cross-domain navigation clears both logs, same-origin keeps them', async () => {
   const session = await ready();
   session.emit('browsingContext.navigationStarted', { context: 'ctx-1', url: 'https://example.com/', timestamp: 1 });

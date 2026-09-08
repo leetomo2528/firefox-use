@@ -174,9 +174,9 @@ function missingTabId(tabId) {
 function requireExplicitTab(tool, tabId, inBatch) {
   if (!inBatch || !missingTabId(tabId)) return;
   throw new Error(
-    `${tool}: tabId is required here. Inside browser_batch, navigate (and other tools that act on a `
-    + 'page) requires an explicit tabId. Call tabs_context_mcp, or use the tabId that tabs_create_mcp '
-    + 'reported, and pass it to every item in the batch.'
+    `${tool}: this call needs an explicit tabId. A batched item never inherits a tab, because the batch `
+    + 'itself may have opened one; take the id from tabs_context_mcp, or from the tabs_create_mcp that ran '
+    + 'earlier in the same batch, and put it on every item that touches a page.'
   );
 }
 
@@ -652,17 +652,37 @@ function tools(ctx) {
     {
       name: 'navigate',
       description:
-        "Navigate to a URL, or go forward/back in browser history. tabId may be omitted for URL navigation when calling navigate STANDALONE (not inside browser_batch): tabs_context_mcp{createIfEmpty:true} is called for you and the first tab in the session's group is navigated \u2014 its result is appended to this call's output so you have the tab list and ids for subsequent calls. Inside browser_batch, navigate (and other tools that act on a page) requires an explicit tabId. Pass an explicit tabId when you need a specific tab or when the session's group has multiple tabs whose state you must preserve. tabId is required for url:\"back\"/\"forward\".",
+        'Send a tab to an address, or walk that tab through the history it has already built. Only url is '
+        + 'always required. For an ordinary address you may leave tabId out when navigate is called on its own: '
+        + "the session's tab group is opened or reused for you (the work tabs_context_mcp{createIfEmpty:true} "
+        + "does), the group's first tab is driven, and the refreshed listing is printed under the result so the "
+        + 'ids are in front of you for the next call. Two cases have no fallback and fail without a tabId: url '
+        + 'set to "back" or "forward", and any navigate running inside browser_batch, where a guessed tab would '
+        + 'be the one that existed before the batch opened its own. Name the tab yourself whenever the group '
+        + 'holds several pages and the others are mid-task. The call returns after loading settles, which '
+        + 'retires every ref_N an earlier read_page handed out - read the page again before using refs. In '
+        + 'Firefox the page opens in the automation profile this server launched, apart from your everyday '
+        + 'windows and with no per-site approval step; a load parked behind an alert or a beforeunload prompt '
+        + 'is cleared with firefox_dialog instead of ending the session.',
       inputSchema: {
         type: 'object',
         properties: {
           url: {
             type: 'string',
-            description: 'The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.',
+            description:
+              'Where to go: a full address, or a bare one such as example.com or localhost:3000, which gets '
+              + 'https:// put in front of it when no scheme is present. The two literal words "back" and '
+              + '"forward" (case ignored) load nothing new and move one entry through this tab\'s own history '
+              + 'instead.',
           },
           tabId: {
             type: 'number',
-            description: 'Tab ID to navigate. Must be a tab in the current group. If omitted for URL navigation when calling navigate standalone, tabs_context_mcp{createIfEmpty:true} is called for you. Required for url:"back"/"forward" and for navigate (and other tools that act on a page) inside browser_batch.',
+            description:
+              "Which tab of this session's group does the navigating; ids come from tabs_context_mcp. Omit it "
+              + "only for a plain address in a standalone call, where the group's first tab is used and a group "
+              + 'is opened if none exists yet. It is mandatory for "back" and "forward", mandatory for every '
+              + 'navigate inside browser_batch, and worth passing whenever one particular page has to be the one '
+              + 'that moves.',
           },
         },
         required: ['url'],
@@ -679,15 +699,36 @@ function tools(ctx) {
     {
       name: 'resize_window',
       description:
-        "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+        'Change the size of the Firefox window a tab lives in, so a layout can be checked at phone, tablet or '
+        + 'desktop width and so screenshots taken afterwards come out at that geometry. width, height and tabId '
+        + 'are all required; there is no implicit tab here. The real window is resized when Firefox allows that; '
+        + "headless runs and older builds refuse that, and the tab's viewport is stretched instead, which puts "
+        + 'the page at the same size. The reply names whichever path ran and quotes the innerWidth x '
+        + 'innerHeight the page ended up reporting - expect it to fall short of the numbers you asked for, '
+        + 'since toolbars come out of the window box and the browser clamps sizes it thinks are too small. Only '
+        + 'the tab you name is affected; the rest of the group keeps rendering as it was.',
       inputSchema: {
         type: 'object',
         properties: {
-          width: { type: 'number', description: 'Target window width in pixels' },
-          height: { type: 'number', description: 'Target window height in pixels' },
+          width: {
+            type: 'number',
+            description:
+              'How wide to make the window, in pixels; must be positive. Browser chrome takes part of it, so '
+              + 'the page area lands narrower than this - the reply says what the page actually measured.',
+          },
+          height: {
+            type: 'number',
+            description:
+              'How tall to make the window, in pixels; must be positive. The tab strip and toolbar are '
+              + 'subtracted from it, so the visible page is shorter; the reply quotes the innerHeight it settled '
+              + 'on.',
+          },
           tabId: {
             type: 'number',
-            description: "Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            description:
+              'The tab whose window gets resized; required, with nothing guessed for you. Take the id from '
+              + "tabs_context_mcp. If Firefox turns the window resize down, only this tab's viewport is changed "
+              + 'and the other tabs are left alone.',
           },
         },
         required: ['width', 'height', 'tabId'],
@@ -700,18 +741,40 @@ function tools(ctx) {
     {
       name: 'javascript_tool',
       description:
-        "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+        'Evaluate JavaScript inside a page and hand back what its final expression produced. All three fields '
+        + 'are required: action pinned to javascript_exec, text carrying the source, and tabId naming the page. '
+        + "The snippet runs in the page's own world, so the document, window, and whatever globals the site "
+        + 'defined are all within reach, and anything it changes is really changed. It behaves like a console '
+        + 'rather than a function body: top-level await is allowed, and the value of the last expression comes '
+        + 'back by itself, so finish with the expression instead of a return statement. Results are stringified '
+        + '(objects as indented JSON) and cut off at 10000 characters, with a line saying how long the full '
+        + 'text was. A throw from the page fails the call with its message and the frame that raised it. Two '
+        + 'things script cannot do here: fill a file input, which needs file_upload or upload_image, and get '
+        + 'past its own alert or confirm - that parks the page until firefox_dialog answers it, which in '
+        + 'Firefox is recoverable rather than the end of the session.',
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', description: "Must be set to 'javascript_exec'" },
+          action: {
+            type: 'string',
+            description:
+              'Fixed string: send javascript_exec, spelled exactly that way. Any other value is turned away '
+              + 'before the page is touched.',
+          },
           text: {
             type: 'string',
-            description: 'The JavaScript code to execute. Evaluated in the page context with REPL semantics: top-level `await` works, and the result of the last expression is returned automatically \u2014 write the expression you want (e.g. `window.myData.value`, or `await fetch(url).then(r=>r.json())`) rather than `return ...`. You can access and modify the DOM, call page functions, and interact with page variables.',
+            description:
+              'The source to evaluate. Console semantics: top-level await works, and the last expression is '
+              + "the result, so write `document.title` or `await fetch('/api/status').then(r => r.json())` and "
+              + 'skip the return; statements ahead of it run normally. It executes in the page context, with '
+              + 'the DOM, window and page globals available and its writes sticking to the live document. '
+              + 'Anything past 10000 characters of output is trimmed.',
           },
           tabId: {
             type: 'number',
-            description: "Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            description:
+              'The page to run in; required, never guessed. Use an id tabs_context_mcp listed for this '
+              + 'session - a tab outside the group, or one already closed, is refused.',
           },
         },
         required: ['action', 'text', 'tabId'],
@@ -724,18 +787,39 @@ function tools(ctx) {
     {
       name: 'form_input',
       description:
-        "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+        'Fill one form control that read_page has already tagged with a ref, without aiming a click at it. '
+        + 'ref, value and tabId are all required. Text boxes, textareas, number and date fields, '
+        + 'contenteditable regions, checkboxes, radios and dropdowns are covered; a file input is not, and goes '
+        + 'through file_upload or upload_image, which read only from the directories this server is allowed to '
+        + "open. The write goes through the element's native setter and is followed by input and change events, "
+        + 'while checkboxes and radios are toggled with a real click, so React and its relatives notice the '
+        + 'change. A dropdown is matched against option values first, then against the labels shown to the '
+        + 'user, ignoring case on a last pass; when nothing matches, the error lists the options that exist. '
+        + 'Disabled controls are turned down. A ref lives only as long as the node behind it, so after a '
+        + 'navigation, a reload, or a re-render that swaps the element out, run read_page again or this fails '
+        + 'with an unknown-ref error.',
       inputSchema: {
         type: 'object',
         properties: {
-          ref: { type: 'string', description: 'Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")' },
+          ref: {
+            type: 'string',
+            description:
+              'The element id read_page handed out, shaped like ref_1 or ref_2. It names one live node, so '
+              + 'take it from the most recent read of this page; older ids are usually stale.',
+          },
           value: {
             type: ['string', 'boolean', 'number'],
-            description: 'The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number',
+            description:
+              'What the control should end up holding. Text-like fields take a string or a number. Checkboxes '
+              + 'and radios take true or false (an empty string, or "false", "no", "0", "off", also reads as '
+              + "unchecked). A dropdown takes either the option's value attribute or the label the user sees. "
+              + 'Arrays and objects are rejected instead of being stringified into the field.',
           },
           tabId: {
             type: 'number',
-            description: "Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            description:
+              'The tab holding the element; required. Ids come from tabs_context_mcp, and the ref has to '
+              + "belong to that same tab's document.",
           },
         },
         required: ['ref', 'value', 'tabId'],
@@ -749,13 +833,23 @@ function tools(ctx) {
       name: 'tabs_context_mcp',
       title: 'Tabs Context',
       description:
-        'Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.',
+        'List the tabs this session owns - numeric id, current address, page title, and which one holds focus. '
+        + 'Run it before any other browser tool, because they all address a page by an id from this list, and '
+        + 'run it again after tabs open or close. The group only ever holds tabs this server opened in the '
+        + 'Firefox profile it launched, so the windows you browse in yourself are neither listed nor driven, '
+        + 'and no site has to grant automation permission first. When no group exists yet the reply says so and '
+        + 'points at createIfEmpty. Give a new conversation a tab of its own with tabs_create_mcp rather than '
+        + 'taking over one that is already busy, unless the user asked you to work in the tab that is open.',
       inputSchema: {
         type: 'object',
         properties: {
           createIfEmpty: {
             type: 'boolean',
-            description: 'Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.',
+            description:
+              'Pass true to have an empty group opened for you when the session has none: a new window with '
+              + 'one blank tab, listed in the reply and ready to navigate. Left out it counts as false, and a '
+              + 'session with no group is only told it has none. It does nothing once a group exists and never '
+              + 'appends a second tab - that is what tabs_create_mcp is for.',
           },
         },
         required: [],
@@ -769,7 +863,13 @@ function tools(ctx) {
       name: 'tabs_create_mcp',
       title: 'Tabs Create',
       description:
-        'Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist. Tabs you create are yours to clean up: close each one with tabs_close_mcp as soon as you no longer need it, and close any that remain before finishing your task. Leave a tab open only if the user asked to see it or wants it kept open.',
+        'Open one more blank tab (about:blank) in the session tab group and report its id together with what the '
+        + 'group now holds. It takes no arguments. The tab joins whichever Firefox window the group already '
+        + 'occupies, or brings one of its own when the group is empty. Call tabs_context_mcp once first, so you '
+        + 'know the group you are adding to, then put the id you were just given on a navigate to load '
+        + 'something into it. Whatever you open is yours to clear away: close it with tabs_close_mcp the moment it stops '
+        + 'being useful, and leave none of your own tabs behind when the task ends - keep one only when the '
+        + 'user wants to look at it.',
       inputSchema: { type: 'object', properties: {}, required: [] },
       handler: async () => {
         const session = await ctx.session();
@@ -780,13 +880,20 @@ function tools(ctx) {
       name: 'tabs_close_mcp',
       title: 'Tabs Close',
       description:
-        "Close a tab in the MCP tab group by its ID. Use to clean up tabs you're done with. Only tabs in this session's group are closable; call tabs_context_mcp first to get valid IDs. If you close the group's last tab, Firefox auto-removes the group \u2014 the next tabs_context_mcp with createIfEmpty starts fresh.",
+        'Shut one tab out of the session tab group, addressed by id - the way you tidy up once a page has served its '
+        + 'purpose. tabId is required, and has to be an id tabs_context_mcp reported: a tab from one of your '
+        + 'own windows, or one that is already gone, is refused rather than quietly ignored. Ids are handed out '
+        + 'in sequence and never reused, so a closed one stays invalid for the rest of the session. Shutting '
+        + 'the last remaining tab empties the group and Firefox drops it; a later tabs_context_mcp that passes '
+        + 'createIfEmpty, or any tabs_create_mcp, builds a fresh one.',
       inputSchema: {
         type: 'object',
         properties: {
           tabId: {
             type: 'integer',
-            description: 'The ID of the tab to close. Must be in this session\'s tab group. Get valid IDs from tabs_context_mcp.',
+            description:
+              'Id of the tab to close, an integer taken from tabs_context_mcp. It has to be one of the tabs '
+              + 'this session opened for itself.',
           },
         },
         required: ['tabId'],

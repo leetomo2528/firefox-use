@@ -216,7 +216,7 @@ function resolvePaths(paths, ctx) {
       ? `${files[0].path} is ${formatBytes(total)}`
       : `These ${plural(files.length, 'file')} add up to ${formatBytes(total)}`;
     throw new Error(
-      `${much}. The combined size of all files in a single call must stay under 10 MB.`
+      `${much}. One call may carry less than 10 MB across every path it names.`
     );
   }
   return { files, total };
@@ -232,7 +232,7 @@ function targetTab(session, tabId) {
 // The one way to fill a file input: hand BiDi the element and the paths.
 async function attachFiles(session, tabId, ref, files) {
   if (typeof ref !== 'string' || !ref.trim()) {
-    throw new Error('ref is required: use read_page or find to locate the file input, then pass its ref.');
+    throw new Error('ref is required: locate the file input with read_page or find, then pass the ref it printed.');
   }
   const context = session.requireContext(tabId);
   await session.ensureRefStore(tabId);
@@ -367,9 +367,9 @@ async function dropImage(session, tabId, image, name, imageId, x, y) {
 async function uploadImage(session, { imageId, ref, coordinate, tabId, filename } = {}, ctx = {}) {
   const hasRef = typeof ref === 'string' && ref.trim() !== '';
   const hasPoint = coordinate !== undefined && coordinate !== null;
-  if (hasRef && hasPoint) throw new Error('Provide either ref or coordinate, not both.');
+  if (hasRef && hasPoint) throw new Error('ref and coordinate are alternatives: pass exactly one of them.');
   if (!hasRef && !hasPoint) {
-    throw new Error('Provide either ref (a file input or drop target) or coordinate ([x, y] of a visible drop target).');
+    throw new Error('Aim the image with one of ref (a file input or drop target) or coordinate ([x, y] over a visible drop target).');
   }
   const image = requireImage(session, imageId);
   const name = imageName(filename, image.mimeType);
@@ -412,22 +412,42 @@ function tools(ctx) {
   return [
     {
       name: 'file_upload',
-      description: 'Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs \u2014 clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the folders this server may upload from can be uploaded; every other path is rejected, including a symlink that resolves out of them. Those folders are the downloads folder of this session, the directory the server was started in, and any absolute path listed in the FIREFOX_USE_UPLOAD_ROOTS environment variable; a rejection names the roots that are allowed. The combined size of all files in a single call must stay under 10 MB.',
+      description: 'Puts one or more files from this machine into an <input type="file"> on the page. '
+        + 'Never try to click the input or the button that fronts it: Firefox answers a click with the operating '
+        + "system's own picker window, which sits outside the page where nothing here can reach it. Locate the input "
+        + 'with read_page or find instead, then call this tool with the ref it was listed under. All three arguments - '
+        + 'paths, ref and tabId - are required. Reading a file is gated: a path is accepted only when it resolves '
+        + "inside an upload root, meaning this session's download folder, the directory the server process was started "
+        + 'in, or an absolute path named in the FIREFOX_USE_UPLOAD_ROOTS environment variable (separate several with '
+        + 'the platform path separator). Symlinks are followed before that check, so a link parked in a root but '
+        + 'aimed outside one is turned down as well, and the refusal lists the roots that would have worked. Chrome '
+        + 'instead scopes uploads to whatever the user shared with the conversation; this server has no such notion. '
+        + 'One call may carry less than 10 MB in total across every file named. Afterwards the input is read back and '
+        + 'the result states how many files it now holds, which is how you catch an input with no multiple attribute '
+        + 'keeping just one of several.',
       inputSchema: {
         type: 'object',
         properties: {
           paths: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute paths to the files to upload. Each path must resolve inside one of the folders this server may upload from (its downloads folder, the directory it was started in, or a FIREFOX_USE_UPLOAD_ROOTS entry).',
+            description: 'One absolute path per file, with a leading ~ expanded for you. Folders are turned down; '
+              + 'name the files themselves. Each entry has to sit, after symlinks are resolved, in an upload root - '
+              + "this session's download folder, the directory the server was launched from, or an entry of "
+              + 'FIREFOX_USE_UPLOAD_ROOTS. Sizes are added up and a total of 10 MB or more fails the call before the '
+              + 'page is touched at all.',
           },
           ref: {
             type: 'string',
-            description: 'Element reference ID of the file input from read_page or find tools (e.g., "ref_1", "ref_2").',
+            description: 'The id read_page or find printed beside the file input, in the form ref_12. A ref belongs '
+              + 'to the snapshot it came from, so read the page again after a navigation or a re-render rather than '
+              + 'reusing an older one.',
           },
           tabId: {
             type: 'number',
-            description: 'Tab ID where the file input is located. Use tabs_context_mcp first if you don\'t have a valid tab ID.',
+            description: 'The tab holding that input. Run tabs_context_mcp when you do not already have a live id. '
+              + 'There is no per-site approval step as in Chrome - the file lands in the page straight away, in the '
+              + 'dedicated Firefox profile this server drives.',
           },
         },
         required: ['paths', 'ref', 'tabId'],
@@ -436,30 +456,48 @@ function tools(ctx) {
     },
     {
       name: 'upload_image',
-      description: 'Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.',
+      description: 'Feeds a picture the session is already holding - a screenshot or zoom taken with the computer '
+        + 'tool, which prints an imageId such as img_3 - into a page, so no file has to travel through you. There '
+        + 'are two ways to aim it and you must pick exactly one: ref, an element from read_page or find, which is '
+        + 'how you reach a file input the page keeps hidden behind styling; or coordinate, an [x, y] point in the '
+        + 'viewport, for editors that take a dropped file and expose no input at all. Giving both is an error and so '
+        + 'is giving neither; imageId and tabId are always needed. Down the ref path the image is written to a '
+        + "scratch file in this session's download folder and handed to the input, and should that element turn out "
+        + 'not to be a file input, the tool scrolls to it and drops the image on it instead. Down the coordinate '
+        + 'path whatever sits under the point gets a synthesized dragenter, dragover and drop, plus a paste event as '
+        + 'a fallback when none of the three was taken up. Read the result line: it names which of drop, paste or '
+        + 'nothing the page actually handled, so a target that quietly ignored the image cannot pass for success.',
       inputSchema: {
         type: 'object',
         properties: {
           imageId: {
             type: 'string',
-            description: 'ID of a previously captured screenshot (from the computer tool\'s screenshot action) or a user-uploaded image',
+            description: 'The id reported when the picture was captured by the computer tool (its screenshot or zoom '
+              + 'action), for instance img_3; an image the user supplied carries one too. Only the 20 most recent '
+              + 'survive in the session, so an id from much earlier may already be gone.',
           },
           ref: {
             type: 'string',
-            description: 'Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Use this for file inputs (especially hidden ones) or specific elements. Provide either ref or coordinate, not both.',
+            description: 'An element id from read_page or find, in the form ref_9. Reach for it whenever the target '
+              + 'can be named - above all a file input the page hides - rather than aiming at pixels. Cannot be '
+              + 'combined with coordinate, and goes stale as soon as the page navigates or re-renders.',
           },
           coordinate: {
             type: 'array',
             items: { type: 'number' },
-            description: 'Viewport coordinates [x, y] for drag & drop to a visible location. Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both.',
+            description: 'A point [x, y] in viewport pixels, for a visible region that accepts dropped files without '
+              + 'exposing an input. Take the numbers off the newest screenshot; a scroll or a layout shift since '
+              + 'then has moved the target out from under them. Cannot be combined with ref.',
           },
           tabId: {
             type: 'number',
-            description: 'Tab ID where the target element is located. This is where the image will be uploaded to.',
+            description: 'The tab that is to receive the image; always required. tabs_context_mcp lists the ids of '
+              + "this session's tabs if you do not have one.",
           },
           filename: {
             type: 'string',
-            description: 'Optional filename for the uploaded file (default: "image.png")',
+            description: 'The name the page should see, image.png when you leave it out. A directory part is '
+              + 'stripped off, and a bare name with no suffix gains .png, or .jpg when the capture is a JPEG.',
           },
         },
         required: ['imageId', 'tabId'],

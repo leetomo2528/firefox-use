@@ -279,7 +279,7 @@ test('the sandbox is enforced through the tool handler, not only the direct call
 
 // --- the 10 MB budget -----------------------------------------------------
 
-test('the combined size limit is 10 MB across all files, with the spec wording', async () => {
+test('the combined size limit is 10 MB across all files, in our own wording', async () => {
   const session = new FakeSession();
   const a = tmpSparse('big-a.bin', 6 * 1024 * 1024);
   const b = tmpSparse('big-b.bin', 6 * 1024 * 1024);
@@ -287,7 +287,7 @@ test('the combined size limit is 10 MB across all files, with the spec wording',
     upload(session, { paths: [a, b], ref: 'ref_1', tabId: 1 }),
     (err) => {
       assert.match(err.message, /These 2 files add up to 12\.0 MB\./);
-      assert.match(err.message, /The combined size of all files in a single call must stay under 10 MB\./);
+      assert.match(err.message, /One call may carry less than 10 MB across every path it names\./);
       return true;
     }
   );
@@ -301,7 +301,7 @@ test('the budget is exclusive: 10 MB exactly is refused, a byte under is not', a
     (err) => {
       assert.equal(
         err.message,
-        `${at} is 10.0 MB. The combined size of all files in a single call must stay under 10 MB.`,
+        `${at} is 10.0 MB. One call may carry less than 10 MB across every path it names.`,
         'a single oversized file is named, not counted as "These 1 file"'
       );
       return true;
@@ -380,7 +380,7 @@ test('file_upload without a ref says which tool produces one', async () => {
   const session = new FakeSession();
   await assert.rejects(
     upload(session, { paths: [tmpFile('h.txt')], tabId: 1 }),
-    /ref is required: use read_page or find to locate the file input/
+    /ref is required: locate the file input with read_page or find/
   );
 });
 
@@ -437,11 +437,11 @@ test('ref and coordinate are mutually exclusive, and one is required', async () 
   const { session, imageId } = sessionWithImage();
   await assert.rejects(
     uploadImage(session, { imageId, ref: 'ref_1', coordinate: [10, 20], tabId: 1 }, ctxFor(session)),
-    /^Error: Provide either ref or coordinate, not both\.$/
+    /^Error: ref and coordinate are alternatives: pass exactly one of them\.$/
   );
   await assert.rejects(
     uploadImage(session, { imageId, tabId: 1 }, ctxFor(session)),
-    /Provide either ref .* or coordinate/
+    /Aim the image with one of ref .* or coordinate/
   );
   assert.equal(session.calls.length, 0);
 });
@@ -741,38 +741,67 @@ function schemaShape(node) {
   return out;
 }
 
-test('the tool definitions keep the Chrome schemas verbatim', () => {
-  const spec = require('../docs/chrome-tool-spec.json');
-  const specTools = spec.tools || spec;
+// The Chrome reference is generated locally (npm run spec) and never committed,
+// so these checks stand down when it is absent - see test/parity.test.js.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+const specTool = (name) => (SPEC.tools || SPEC).find((t) => t.name === name);
+
+test('the tool definitions keep the Chrome schema shapes', { skip: skipSpec }, () => {
   const defs = tools(ctxFor(new FakeSession()));
   assert.deepEqual(defs.map((t) => t.name).sort(), ['file_upload', 'upload_image']);
   for (const def of defs) {
-    const want = specTools.find((t) => t.name === def.name);
+    const want = specTool(def.name);
     assert.ok(want, `${def.name} is in the spec`);
+    // Properties, types, required and the rest have to match exactly; the
+    // description strings are the one part that is ours to write.
     assert.deepEqual(schemaShape(def.inputSchema), schemaShape(want.inputSchema), `${def.name} inputSchema`);
+    for (const [prop, theirs] of Object.entries(want.inputSchema.properties || {})) {
+      if (!theirs.description) continue;
+      const ours = def.inputSchema.properties[prop];
+      assert.ok(ours && ours.description, `${def.name}.${prop} needs a description`);
+    }
+  }
+});
+
+test('the prose is written here, not copied from Chrome', { skip: skipSpec }, () => {
+  for (const def of tools(ctxFor(new FakeSession()))) {
+    const want = specTool(def.name);
+    assert.notEqual(def.description.trim(), want.description.trim(), `${def.name} description is verbatim`);
+    for (const [prop, theirs] of Object.entries(want.inputSchema.properties || {})) {
+      if (!theirs.description) continue;
+      assert.notEqual(
+        def.inputSchema.properties[prop].description.trim(), theirs.description.trim(),
+        `${def.name}.${prop} is verbatim`
+      );
+    }
+  }
+});
+
+// Holds with or without the reference file.
+test('the definitions are wired up and document the tools', () => {
+  const defs = tools(ctxFor(new FakeSession()));
+  for (const def of defs) {
     assert.equal(typeof def.handler, 'function');
     for (const required of def.inputSchema.required) {
       assert.ok(def.inputSchema.properties[required], `${def.name} requires undeclared "${required}"`);
     }
-    for (const [prop, def_] of Object.entries(want.inputSchema.properties || {})) {
-      if (!def_.description) continue;
-      const ours = def.inputSchema.properties[prop];
-      assert.ok(ours && ours.description, `${def.name}.${prop} needs a description`);
-      // file_upload.paths had to change with the sandbox; nothing else did, and
-      // schemaShape above would not notice if it silently drifted.
-      if (def.name === 'file_upload' && prop === 'paths') continue;
-      assert.equal(ours.description, def_.description, `${def.name}.${prop} description drifted`);
+    for (const [prop, schema] of Object.entries(def.inputSchema.properties)) {
+      assert.ok(schema.description && schema.description.length >= 10, `${def.name}.${prop} needs a description`);
     }
   }
-  // upload_image says nothing about where files come from, so it stays verbatim.
+  // upload_image is useless unless the two aiming modes and their rule are said
+  // out loud, and the coordinate gotcha with them.
   const img = defs.find((t) => t.name === 'upload_image');
-  assert.equal(img.description, specTools.find((t) => t.name === 'upload_image').description);
+  assert.match(img.description, /exactly one/);
+  assert.match(img.inputSchema.properties.ref.description, /coordinate/);
+  assert.match(img.inputSchema.properties.coordinate.description, /\bref\b/);
+  assert.match(img.inputSchema.properties.coordinate.description, /newest screenshot/);
+  assert.match(img.inputSchema.properties.filename.description, /image\.png/);
 });
 
 test('file_upload documents the sandbox it actually enforces', () => {
-  const spec = require('../docs/chrome-tool-spec.json');
-  const specTools = spec.tools || spec;
-  const want = specTools.find((t) => t.name === 'file_upload');
   const def = tools(ctxFor(new FakeSession())).find((t) => t.name === 'file_upload');
 
   // Chrome's promise - attachments and folders the user connected - describes a
@@ -784,14 +813,13 @@ test('file_upload documents the sandbox it actually enforces', () => {
   }
   // ... and it names the rule that is enforced, so a rejection is predictable.
   assert.match(def.description, /FIREFOX_USE_UPLOAD_ROOTS/);
-  assert.match(def.description, /symlink/);
+  assert.match(def.description, /[Ss]ymlink/);
+  assert.match(def.description, /10 MB/);
   assert.match(def.inputSchema.properties.paths.description, /FIREFOX_USE_UPLOAD_ROOTS/);
-
-  // Everything either side of that one sentence is still the Chrome wording.
-  const head = want.description.slice(0, want.description.indexOf('Only files'));
-  const tail = 'The combined size of all files in a single call must stay under 10 MB.';
-  assert.ok(def.description.startsWith(head), 'the read_page / do-not-click guidance is unchanged');
-  assert.ok(def.description.endsWith(tail), 'the 10 MB budget is unchanged');
+  assert.match(def.inputSchema.properties.paths.description, /10 MB/);
+  // The one thing a model must not do with a file input is click it.
+  assert.match(def.description, /read_page or find/);
+  assert.match(def.description, /click/);
 });
 
 test('building the tools opens no browser, and the handler passes ctx through', async () => {

@@ -5,13 +5,30 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const a11y = require('../src/a11y');
 const { NO_REF, NO_TAB } = require('../src/session');
 const { FakeSession, fakeCtx } = require('./helpers/fake-session');
 
-const SPEC = require('../docs/chrome-tool-spec.json');
+// The Chrome reference is generated from your own Claude Code install by
+// `npm run spec` and never committed, so the checks that need it skip when it is
+// absent. What we compare is schema shape only - the prose on this side is ours.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+function schemaShape(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description') continue;
+    out[key] = schemaShape(value);
+  }
+  return out;
+}
 
 // --- DOM shim --------------------------------------------------------------
 
@@ -770,21 +787,65 @@ test('TEXT_FN counts a nested article only once', () => {
 
 // --- tool definitions ------------------------------------------------------
 
-test('tool definitions match the Chrome spec verbatim', () => {
+test('the three tools are declared, wired and shaped as documented', () => {
   const defs = a11y.tools(fakeCtx(new FakeSession()));
   assert.deepStrictEqual(defs.map((d) => d.name), ['read_page', 'find', 'get_page_text']);
   for (const def of defs) {
-    const spec = SPEC.find((s) => s.name === def.name);
-    assert.ok(spec, `${def.name} exists in ${path.basename('chrome-tool-spec.json')}`);
-    assert.strictEqual(def.description, spec.description, `${def.name} description`);
-    assert.deepStrictEqual(def.inputSchema, spec.inputSchema, `${def.name} inputSchema`);
-    assert.deepStrictEqual(Object.keys(def.inputSchema.properties), Object.keys(spec.inputSchema.properties));
-    assert.deepStrictEqual(def.inputSchema.required, spec.inputSchema.required);
-    assert.strictEqual(typeof def.handler, 'function');
+    assert.strictEqual(typeof def.handler, 'function', `${def.name} handler`);
+    assert.strictEqual(def.inputSchema.type, 'object', `${def.name} schema type`);
+    assert.ok(def.description.trim().length >= 60, `${def.name} needs a real description`);
+    for (const [prop, def2] of Object.entries(def.inputSchema.properties)) {
+      assert.ok(
+        typeof def2.description === 'string' && def2.description.trim().length >= 10,
+        `${def.name}.${prop} needs a description`
+      );
+    }
+    for (const required of def.inputSchema.required) {
+      assert.ok(def.inputSchema.properties[required], `${def.name} requires undeclared "${required}"`);
+    }
   }
   const readPage = defs[0].inputSchema.properties;
   assert.deepStrictEqual(readPage.filter.enum, ['interactive', 'all']);
   assert.deepStrictEqual(Object.keys(readPage), ['filter', 'tabId', 'depth', 'ref_id', 'max_chars']);
+  assert.deepStrictEqual(defs[0].inputSchema.required, ['tabId']);
+  assert.deepStrictEqual(Object.keys(defs[1].inputSchema.properties), ['query', 'tabId']);
+  assert.deepStrictEqual(defs[1].inputSchema.required, ['query', 'tabId']);
+  assert.deepStrictEqual(Object.keys(defs[2].inputSchema.properties), ['tabId']);
+  assert.deepStrictEqual(defs[2].inputSchema.required, ['tabId']);
+});
+
+// Shape only: names, types, enums, required and limits are what make a browser
+// task portable between the two integrations.
+test('schemas line up with the Chrome definitions, shape for shape', { skip: skipSpec }, () => {
+  const defs = a11y.tools(fakeCtx(new FakeSession()));
+  for (const def of defs) {
+    const spec = SPEC.find((s) => s.name === def.name);
+    assert.ok(spec, `${def.name} exists in ${path.basename(SPEC_PATH)}`);
+    assert.deepStrictEqual(
+      schemaShape(def.inputSchema),
+      schemaShape(spec.inputSchema),
+      `${def.name}: properties, types, enums and required must match`
+    );
+  }
+});
+
+// Anthropic's wording stays Anthropic's: ours has to be written here.
+test('the prose is our own, not the Chrome text', { skip: skipSpec }, () => {
+  const defs = a11y.tools(fakeCtx(new FakeSession()));
+  for (const def of defs) {
+    const spec = SPEC.find((s) => s.name === def.name);
+    assert.notStrictEqual(
+      def.description.trim(), spec.description.trim(),
+      `${def.name}: the description is the Chrome one verbatim - write our own`
+    );
+    for (const [prop, ref] of Object.entries(spec.inputSchema.properties || {})) {
+      if (!ref.description) continue;
+      assert.notStrictEqual(
+        def.inputSchema.properties[prop].description.trim(), ref.description.trim(),
+        `${def.name}.${prop}: parameter text is the Chrome one verbatim - rewrite it`
+      );
+    }
+  }
 });
 
 test('handlers take the session from ctx and return text', async () => {

@@ -522,12 +522,18 @@ class GifRecorder {
   }
 }
 
-const DESCRIPTION = 'Manage GIF recording and export for browser automation sessions. '
-  + 'Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF '
-  + "with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. "
-  + 'When starting recording, take a screenshot immediately after to capture the initial state as the first frame. '
-  + 'When stopping recording, take a screenshot immediately before to capture the final state as the last frame. '
-  + "For export, set 'download: true' to download the GIF.";
+const DESCRIPTION = 'Films a tab as a run of screenshots and encodes them into an animated GIF, with the clicks and '
+  + 'drags of the run marked on the frames that show what they did. Four actions, and every one of them needs tabId '
+  + 'because a recording belongs to a single tab: start_recording opens the loop and grabs a first frame right away, '
+  + 'stop_recording ends the loop after one closing frame and keeps everything captured, export encodes the frames '
+  + 'into a .gif on disk, clear throws them out. The loop grabs a frame about every 700 ms and halts itself once 120 '
+  + 'are in hand; frames are shrunk to at most 800 px wide, and the delay stored in the GIF follows the cadence that '
+  + 'was really measured, not the nominal one. Calling export while the loop still runs stops it first, and the '
+  + 'frames outlive the export - clear them when you are done, or the next start_recording carries on the same set. '
+  + 'Frames live in server memory only: a tab that closes mid-recording ends the loop with a note in the next reply, '
+  + 'and any frame whose size differs from the first (a window resize partway through) is dropped at encode time and '
+  + 'counted in the result. Where Chrome pushes the finished GIF through the browser download machinery, this server '
+  + "writes it into the session's download folder itself and gives you back the full path.";
 
 const INPUT_SCHEMA = {
   type: 'object',
@@ -535,30 +541,49 @@ const INPUT_SCHEMA = {
     action: {
       type: 'string',
       enum: ['start_recording', 'stop_recording', 'export', 'clear'],
-      description: "Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)",
+      description: 'Which step to run. start_recording begins capturing this tab, or picks up a set of frames that '
+        + 'was stopped earlier; stop_recording closes the loop while keeping the frames; export turns them into a GIF '
+        + 'file; clear discards them and frees the memory.',
     },
     tabId: {
       type: 'number',
-      description: 'Tab ID to identify which tab group this operation applies to',
+      description: 'The tab to film. Frames are filed under this id, so stop_recording, export and clear only touch '
+        + 'the recording that was started for the same tab. tabs_context_mcp lists the ids in this session.',
     },
     download: {
       type: 'boolean',
-      description: "Always set this to true for the 'export' action only. This causes the gif to be downloaded in the browser.",
+      description: 'Kept so a call written for Chrome runs here unchanged, where it routes the GIF through the '
+        + "browser's downloads. This server always writes the file itself and returns its path, so the flag alters "
+        + 'nothing; pass it alongside export or leave it off.',
     },
     filename: {
       type: 'string',
-      description: "Optional filename for exported GIF (default: 'recording-[timestamp].gif'). For 'export' action only.",
+      description: 'What the exported file should be called; read by export and ignored elsewhere. Left out, the '
+        + 'server counts up through recording-1.gif, recording-2.gif and so on, stepping over names already in the '
+        + 'folder. Any directory part is stripped, and .gif is appended when the name lacks it.',
     },
     options: {
       type: 'object',
-      description: "Optional GIF enhancement options for 'export' action. Properties: showClickIndicators (bool), showDragPaths (bool), showActionLabels (bool), showProgressBar (bool), showWatermark (bool), quality (number 1-30). All default to true except quality (default: 10).",
+      description: 'Overlay and encoding settings; only export reads them. The five overlay switches - '
+        + 'showClickIndicators, showDragPaths, showActionLabels, showProgressBar, showWatermark - are booleans that '
+        + 'are all on to begin with, and quality is a number from 1 to 30 that starts at 10. Anything you omit keeps '
+        + 'that starting value.',
       properties: {
-        showClickIndicators: { type: 'boolean', description: 'Show orange circles at click locations (default: true)' },
-        showDragPaths: { type: 'boolean', description: 'Show red arrows for drag actions (default: true)' },
-        showActionLabels: { type: 'boolean', description: 'Show black labels describing actions (default: true)' },
-        showProgressBar: { type: 'boolean', description: 'Show orange progress bar at bottom (default: true)' },
-        showWatermark: { type: 'boolean', description: 'Show Claude logo watermark (default: true)' },
-        quality: { type: 'number', description: 'GIF compression quality, 1-30 (lower = better quality, slower encoding). Default: 10' },
+        showClickIndicators: { type: 'boolean', description: 'Ring each recorded click point in orange - a ring '
+          + 'rather than a dot, so whatever was clicked stays readable underneath. On unless set to false.' },
+        showDragPaths: { type: 'boolean', description: 'Trace every drag with a red arrow running from where it '
+          + 'started to where it was released. On unless set to false.' },
+        showActionLabels: { type: 'boolean', description: 'Write the action text belonging to a frame across its '
+          + 'lower left in black on white, at most two entries per frame and each one truncated if long. On unless '
+          + 'set to false.' },
+        showProgressBar: { type: 'boolean', description: 'Run a thin orange bar along the bottom edge that fills as '
+          + 'the animation plays, so a reader can tell how far in a moment is. On unless set to false.' },
+        showWatermark: { type: 'boolean', description: 'Stamp "firefox-use" in the top right corner of every frame '
+          + '(this is where Chrome puts its own mark). On unless set to false.' },
+        quality: { type: 'number', description: 'Whole number from 1 to 30, 10 by default, trading file size against '
+          + 'fidelity: small numbers keep more colors and cost more time, large ones encode fast and coarse. 1 to 5 '
+          + 'holds 256 colors, 6 to 10 holds 128 and still dithers, then 64, 32 and finally 16 as the number climbs. '
+          + 'A value outside the range is rejected.' },
       },
     },
   },

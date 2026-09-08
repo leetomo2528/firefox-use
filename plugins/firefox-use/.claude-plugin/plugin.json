@@ -1,0 +1,9 @@
+{
+  "name": "firefox-use",
+  "version": "0.2.0",
+  "description": "Browser control for Firefox from Claude Code. Adds the claude-in-firefox tools (screenshot, click, type, forms, tabs, console and network logs, uploads, GIF recording) and the skill that tells Claude how to use them. Requires Firefox 129+ and Node 18+; the browser starts on first use in its own profile.",
+  "author": { "name": "Yunje Lee" },
+  "homepage": "https://github.com/leetomo2528/firefox-use",
+  "license": "MIT",
+  "keywords": ["browser", "firefox", "automation", "computer-use", "webdriver-bidi"]
+}

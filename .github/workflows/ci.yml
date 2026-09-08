@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+
+  live-linux:
+    name: live (ubuntu, real Firefox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Straight from Mozilla: the distro packages on this image are snaps,
+      # which cannot see a profile under the runner's home directory.
+      - name: Install Firefox
+        run: |
+          curl -sSL -o firefox.tar.xz "https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US"
+          mkdir -p "$HOME/firefox" && tar -xJf firefox.tar.xz -C "$HOME"
+          echo "FIREFOX_BIN=$HOME/firefox/firefox" >> "$GITHUB_ENV"
+          "$HOME/firefox/firefox" --version
+      - name: Live suite
+        env:
+          FIREFOX_USE_HEADLESS: '1'
+        run: npm run test:integration
+      - name: Firefox log on failure
+        if: failure()
+        run: tail -50 "$HOME/.firefox-use/firefox.log" || true
+
+  live-macos:
+    name: live (macos, real Firefox)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Firefox
+        run: brew install --cask firefox
+      - name: Live suite
+        env:
+          FIREFOX_USE_HEADLESS: '1'
+        run: npm run test:integration
+      - name: Firefox log on failure
+        if: failure()
+        run: tail -50 "$HOME/.firefox-use/firefox.log" || true
+
+  plugin:
+    name: plugin manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Manifests are valid JSON and in sync
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('.claude-plugin/marketplace.json','utf8'))"
+          node -e "JSON.parse(require('fs').readFileSync('plugins/firefox-use/.claude-plugin/plugin.json','utf8'))"
+          node -e "JSON.parse(require('fs').readFileSync('plugins/firefox-use/.mcp.json','utf8'))"
+          npm run sync-plugin -- --check
+      - name: No Anthropic tool definitions are committed
+        run: |
+          if git ls-files | grep -E 'chrome-tool-spec\.json$'; then
+            echo "The extracted spec must stay local (.spec/)."; exit 1
+          fi

@@ -1,0 +1,20 @@
+{
+  "name": "firefox-use",
+  "owner": {
+    "name": "Yunje Lee",
+    "url": "https://github.com/leetomo2528"
+  },
+  "metadata": {
+    "description": "Drive Firefox from Claude Code with the same browser tools it has for Chrome.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "firefox-use",
+      "description": "Browser control for Firefox: screenshots, clicks, typing, forms, tabs, console and network logs, file uploads and GIF recording, over WebDriver BiDi.",
+      "version": "0.2.0",
+      "author": { "name": "Yunje Lee" },
+      "source": "./plugins/firefox-use"
+    }
+  ]
+}

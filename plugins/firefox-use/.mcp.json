@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "claude-in-firefox": {
+      "command": "npx",
+      "args": ["-y", "firefox-use@latest", "mcp"]
+    }
+  }
+}

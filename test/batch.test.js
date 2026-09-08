@@ -9,12 +9,24 @@ const {
   planBatch, knownTool, contentBlocks, itemBlocks, resultError,
 } = require('../src/batch');
 
-const SPEC = require('../docs/chrome-tool-spec.json').find((t) => t.name === 'browser_batch');
-// The one sentence dropped from the Chrome wording: firefox-use has no
-// per-domain permission gate to run between items.
-const PERMISSION_SENTENCE =
-  "Each tool's own permission check runs per item \u2014 if an action navigates to a domain "
-  + "without permission, the next item's check fails and the batch stops. ";
+// The Chrome reference is generated locally by `npm run spec` and never committed,
+// so the parity checks below skip when it is absent. See test/parity.test.js.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const ALL = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const SPEC = ALL ? ALL.find((t) => t.name === 'browser_batch') : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+// Schema shape without any prose: the structure interoperates, the wording is ours.
+function schemaShape(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description') continue;
+    out[key] = schemaShape(value);
+  }
+  return out;
+}
 
 const PNG = Buffer.from('fake-png').toString('base64');
 const image = (data = PNG) => ({ type: 'image', data, mimeType: 'image/png' });
@@ -41,18 +53,62 @@ function stubCtx(answers = {}, extra = {}) {
 const texts = (result) => result.content.filter((b) => b.type === 'text').map((b) => b.text);
 const kinds = (result) => result.content.map((b) => b.type);
 
-test('the tool definition is the Chrome spec, minus the extension-only permission note', () => {
+test('the tool is declared with the shape a batch caller needs', () => {
   const [tool] = tools(stubCtx());
   assert.equal(tool.name, 'browser_batch');
-  assert.deepStrictEqual(tool.inputSchema, SPEC.inputSchema);
-  assert.equal(tool.description, SPEC.description.replace(PERMISSION_SENTENCE, ''));
-  assert.ok(tool.description.includes('coordinates you write in THIS batch refer to the screenshot taken BEFORE this call'));
-  assert.ok(tool.description.endsWith('browser_batch cannot be nested.'));
-  assert.ok(!/permission/i.test(tool.description), 'the Chrome permission gate does not exist here');
-  assert.ok(!/chrome/i.test(tool.description));
-  assert.equal(TOOL.inputSchema.properties.actions.minItems, 1);
-  assert.deepStrictEqual(TOOL.inputSchema.properties.actions.items.required, ['name', 'input']);
   assert.equal(typeof tool.handler, 'function');
+  assert.equal(TOOL.inputSchema.properties.actions.minItems, 1);
+  assert.deepStrictEqual(TOOL.inputSchema.required, ['actions']);
+  assert.deepStrictEqual(TOOL.inputSchema.properties.actions.items.required, ['name', 'input']);
+  for (const prop of ['name', 'input']) {
+    const text = TOOL.inputSchema.properties.actions.items.properties[prop].description;
+    assert.ok(typeof text === 'string' && text.trim().length >= 10, `actions[].${prop} needs a description`);
+  }
+});
+
+// The three things a caller gets wrong if the prose omits them.
+test('the description carries the gotchas', () => {
+  const [tool] = tools(stubCtx());
+  assert.ok(tool.description.length >= 60, 'description is too thin to be useful');
+  assert.match(tool.description, /screenshot taken BEFORE the call/,
+    'must say coordinates come from the screenshot preceding the batch');
+  assert.match(tool.description, /\btabId\b/, 'must say page tools need an explicit tabId');
+  assert.match(tool.description, /firefox_dialog/, 'must point at the dialog escape hatch');
+  assert.match(tool.description, /browser_batch inside itself/, 'must say batches do not nest');
+  assert.match(tool.description, /no per-site permission check/i,
+    'the Chrome permission gate does not exist here, and the prose should say so');
+});
+
+test('the browser_batch schema keeps the Chrome shape', { skip: skipSpec }, () => {
+  const [tool] = tools(stubCtx());
+  assert.deepStrictEqual(
+    schemaShape(tool.inputSchema),
+    schemaShape(SPEC.inputSchema),
+    'properties, types, required and limits must match'
+  );
+});
+
+// Anthropic's wording stays Anthropic's; ours has to be written here.
+test('the browser_batch prose is our own', { skip: skipSpec }, () => {
+  const [tool] = tools(stubCtx());
+  assert.notEqual(
+    tool.description.trim(), SPEC.description.trim(),
+    'the description is copied verbatim - write it in our own words'
+  );
+  const refItems = SPEC.inputSchema.properties.actions.items.properties;
+  const ourItems = TOOL.inputSchema.properties.actions.items.properties;
+  assert.notEqual(
+    TOOL.inputSchema.properties.actions.description.trim(),
+    SPEC.inputSchema.properties.actions.description.trim(),
+    'actions: parameter text is copied verbatim - rewrite it'
+  );
+  for (const [prop, ref] of Object.entries(refItems)) {
+    if (!ref.description) continue;
+    assert.notEqual(
+      ourItems[prop].description.trim(), ref.description.trim(),
+      `actions[].${prop}: parameter text is copied verbatim - rewrite it`
+    );
+  }
 });
 
 test('the source stays ASCII', () => {

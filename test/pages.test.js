@@ -1,8 +1,9 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 const { FakeSession, fakeCtx } = require('./helpers/fake-session');
-const spec = require('../docs/chrome-tool-spec.json');
 const pages = require('../src/pages');
 const {
   navigate, tabsContext, tabsCreate, tabsClose, javascriptTool, resizeWindow, formInput,
@@ -12,6 +13,26 @@ const {
 } = pages;
 
 const MY_TOOLS = ['navigate', 'resize_window', 'javascript_tool', 'form_input', 'tabs_context_mcp', 'tabs_create_mcp', 'tabs_close_mcp'];
+
+// The Chrome reference is generated on the machine that runs it and is never
+// committed:  npm run spec  ->  .spec/chrome-tool-spec.json. Without it the
+// comparisons below skip; everything else in this file runs regardless.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skip = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+// Only the machine-readable part of a schema has to line up: names, types,
+// enums, required, limits. Descriptions are ours, so they are stripped first.
+function schemaShape(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description') continue;
+    out[key] = schemaShape(value);
+  }
+  return out;
+}
 
 function sessionWith(tabs, responses) {
   return new FakeSession({ tabs: tabs.map((t) => ({ ...t })), responses });
@@ -41,24 +62,65 @@ class ScriptSession extends FakeSession {
 
 // --- tool definitions -----------------------------------------------------
 
-test('tool definitions match the Chrome spec, with Chrome renamed to Firefox', () => {
+test('every tool is declared, wired and named the way the schema expects', () => {
   const defs = tools(fakeCtx(new FakeSession()));
   assert.deepEqual(defs.map((d) => d.name), MY_TOOLS);
   for (const def of defs) {
-    const target = spec.find((t) => t.name === def.name);
-    assert.ok(target, `${def.name} missing from the spec`);
-    assert.equal(def.description, target.description.replace(/Chrome/g, 'Firefox'));
-    assert.deepEqual(def.inputSchema, target.inputSchema);
-    assert.equal(def.title, target.title); // the three tabs_* tools carry one
-    assert.equal(typeof def.handler, 'function');
+    assert.equal(typeof def.handler, 'function', `${def.name} has no handler`);
+    assert.equal(def.inputSchema.type, 'object');
+    for (const required of def.inputSchema.required || []) {
+      assert.ok(def.inputSchema.properties[required], `${def.name} requires undeclared "${required}"`);
+    }
   }
 });
 
-test('no description still advertises Chrome', () => {
+test('schema shapes still match the Chrome definitions', { skip }, () => {
   for (const def of tools(fakeCtx(new FakeSession()))) {
-    assert.ok(!/Chrome/.test(def.description), `${def.name} still mentions Chrome`);
-    for (const prop of Object.values(def.inputSchema.properties || {})) {
-      assert.ok(!/Chrome/.test(prop.description || ''), `${def.name} property still mentions Chrome`);
+    const target = SPEC.find((t) => t.name === def.name);
+    assert.ok(target, `${def.name} missing from the reference`);
+    assert.deepEqual(
+      schemaShape(def.inputSchema),
+      schemaShape(target.inputSchema),
+      `${def.name}: properties, types, enums and required must stay identical`
+    );
+    assert.equal(def.title, target.title); // the three tabs_* tools carry one
+  }
+});
+
+test('the prose is ours, not the reference text', { skip }, () => {
+  for (const def of tools(fakeCtx(new FakeSession()))) {
+    const target = SPEC.find((t) => t.name === def.name);
+    assert.notEqual(
+      def.description.trim(), target.description.trim(),
+      `${def.name}: the description is still the reference wording - write it in our own words`
+    );
+    for (const [name, prop] of Object.entries(def.inputSchema.properties || {})) {
+      const theirs = target.inputSchema.properties[name];
+      if (!theirs || !theirs.description || !prop.description) continue;
+      assert.notEqual(
+        prop.description.trim(), theirs.description.trim(),
+        `${def.name}.${name}: parameter text is still the reference wording`
+      );
+    }
+  }
+});
+
+// Descriptions may contrast us with Chrome, but must never read as if this
+// server were driving Chrome: any mention has to sit next to Firefox.
+test('descriptions describe Firefox, and say enough to call the tool', () => {
+  for (const def of tools(fakeCtx(new FakeSession()))) {
+    assert.ok(def.description.length >= 60, `${def.name}: description is too thin`);
+    if (/Chrome/.test(def.description)) {
+      assert.match(def.description, /Firefox/, `${def.name} mentions Chrome without naming Firefox`);
+    }
+    for (const [name, prop] of Object.entries(def.inputSchema.properties || {})) {
+      assert.ok(
+        typeof prop.description === 'string' && prop.description.trim().length >= 10,
+        `${def.name}.${name} needs a description of its own`
+      );
+      if (/Chrome/.test(prop.description)) {
+        assert.match(prop.description, /Firefox/, `${def.name}.${name} mentions Chrome without naming Firefox`);
+      }
     }
   }
 });
@@ -754,7 +816,7 @@ test('navigate inside a batch refuses to guess a tab', async () => {
   ]);
   await assert.rejects(
     () => navigate(session, { url: 'https://new.test/', __inBatch: true }),
-    /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/
+    /this call needs an explicit tabId\. A batched item never inherits a tab/
   );
   // Nothing was driven: the old tab is still showing the url it had.
   assert.equal(session.callsOf('navigate').length, 0);
@@ -798,7 +860,7 @@ test('back and forward keep their own message inside a batch', async () => {
 
 test('the other page tools refuse to guess a tab inside a batch too', async () => {
   const tabs = [{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }];
-  const spec_ = /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/;
+  const spec_ = /this call needs an explicit tabId\. A batched item never inherits a tab/;
 
   const js = sessionWith(tabs);
   await assert.rejects(() => javascriptTool(js, { action: 'javascript_exec', text: '1 + 1', __inBatch: true }), spec_);
@@ -834,7 +896,7 @@ test('the batch runner reaches the same rule through the tool handler', async ()
   const def = tools(ctx).find((d) => d.name === 'navigate');
   await assert.rejects(
     () => def.handler({ url: 'https://new.test/', __inBatch: true }),
-    /Inside browser_batch, navigate \(and other tools that act on a page\) requires an explicit tabId/
+    /this call needs an explicit tabId\. A batched item never inherits a tab/
   );
   assert.equal(session.callsOf('navigate').length, 0);
 });

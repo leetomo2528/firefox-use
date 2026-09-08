@@ -609,11 +609,12 @@ async function computer(session, args = {}, ctx = {}) {
   }
 }
 
-// Tool definition copied from docs/chrome-tool-spec.json; nothing but the
-// browser name may differ, and this tool's text never names one.
+// Tool definition. The schema shape - names, types, enums, limits, required -
+// is the one Chrome's integration declares, so a task written for either
+// browser runs here unchanged; the wording is ours.
 const TOOL = {
     "name": "computer",
-    "description": "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+    "description": "Drive one Firefox tab with synthetic pointer, wheel and keyboard input, and capture what it looks like. Each call performs exactly one `action` from the enum, against the tab named by `tabId`; ask tabs_context_mcp for a valid id before the first call.\n* Aim with `coordinate` (viewport pixels) or, preferably, with `ref` (an element id from read_page or find). Coordinates must come from your latest screenshot: pages scroll and re-render, and stale numbers land on whatever occupies that spot now.\n* A ref belongs to the snapshot that produced it. After a navigation or a re-render, ask read_page or find for new ids rather than reusing old ones.\n* Put the pointer in the middle of a control, not on its border. When a click appears to have done nothing, take a fresh screenshot and re-aim before repeating it.\n* Firefox specifics: this drives a profile the server owns, separate from your everyday browser, and no per-site approval step stands in the way. A native alert, confirm, prompt or beforeunload freezes the tab, and every action here fails until firefox_dialog accepts or dismisses it.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -634,7 +635,7 @@ const TOOL = {
             "scroll_to",
             "hover"
           ],
-          "description": "The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states."
+          "description": "Which operation to run. Every other field is read according to this choice.\n* `left_click`: press and release the primary button on the target.\n* `right_click`: secondary-button click, the usual way to raise a context menu.\n* `double_click`: two primary clicks in quick succession - opens an item, selects a word.\n* `triple_click`: three in a row, which selects the whole line or paragraph under the pointer.\n* `hover`: move the pointer onto the target and press nothing, to raise a tooltip, drop a menu open or trigger a :hover style.\n* `left_click_drag`: hold the primary button down from `start_coordinate` (or from wherever the pointer already sits) and release it on the target.\n* `scroll`: turn the wheel `scroll_amount` notches in `scroll_direction` over the point you give, so the scrollable box under that point is what moves.\n* `type`: send `text` to whatever holds keyboard focus; pass `ref` to click that field first.\n* `key`: press the keys or chords named in `text`, `repeat` times over.\n* `wait`: pause for `duration` seconds while something loads or animates.\n* `screenshot`: capture the visible area of the tab.\n* `zoom`: capture `region` alone, for reading small icons or fine print.\n* `scroll_to`: bring the element named by `ref` into view; it needs no coordinate."
         },
         "coordinate": {
           "type": "array",
@@ -643,17 +644,17 @@ const TOOL = {
           },
           "minItems": 2,
           "maxItems": 2,
-          "description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."
+          "description": "Target point as [x, y] in CSS pixels measured from the top-left corner of the viewport, not of the screen. Give this or `ref` for left_click, right_click, double_click, triple_click, hover, scroll and left_click_drag; on a drag it marks where the button comes up, the end of the movement. Take the numbers from your most recent screenshot - an older one may name a spot the page has since moved. A tab here renders at devicePixelRatio 1, so one pixel of that image is one unit here; no scaling to do. `type` ignores this field, because typing follows keyboard focus."
         },
         "text": {
           "type": "string",
-          "description": "The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., \"Backspace Backspace Delete\"). Supports keyboard shortcuts using the platform's modifier key (use \"cmd\" on Mac, \"ctrl\" on Windows/Linux, e.g., \"cmd+a\" or \"ctrl+a\" for select all). Page zoom shortcuts (e.g. \"cmd+=\", \"ctrl+-\", \"cmd+0\") are not supported and will return an error - use the `zoom` action to magnify a region of the page instead."
+          "description": "Payload for two of the actions. Under `type` it is the literal string to enter, newlines included - each newline goes out as an Enter press. Under `key` it names a key or a chord, or several of them separated by spaces to be pressed in order: \"Enter\", \"cmd+a\", \"ArrowDown ArrowDown Enter\". The modifier names understood are ctrl, shift, alt, cmd (meta) and win (windows), attached to the key with \"+\"; macOS spells with cmd what Windows and Linux spell with ctrl. Chords that rescale the page - \"ctrl+-\", \"cmd+0\" and the like - are refused, since the new scale would be invisible to you; crop with the `zoom` action instead."
         },
         "duration": {
           "type": "number",
           "minimum": 0,
           "maximum": 10,
-          "description": "The number of seconds to wait. Required for `wait`. Maximum 10 seconds."
+          "description": "Seconds the `wait` action sits idle, anywhere from 0 up to 10. Required by `wait`, read by nothing else. Fractions count (0.5 is half a second), and one call will never sit longer than 10 seconds, so wait a second time - with a screenshot in between - when a page needs more."
         },
         "scroll_direction": {
           "type": "string",
@@ -663,13 +664,13 @@ const TOOL = {
             "left",
             "right"
           ],
-          "description": "The direction to scroll. Required for `scroll`."
+          "description": "Which way the wheel turns during `scroll`, and mandatory there: up, down, left or right. `down` walks further down the document, the way a real wheel would."
         },
         "scroll_amount": {
           "type": "number",
           "minimum": 1,
           "maximum": 10,
-          "description": "The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."
+          "description": "Wheel notches per `scroll` call, from 1 to 10; omit it and you get 3. A notch is worth roughly 100 pixels of travel here, so the default moves about 300."
         },
         "start_coordinate": {
           "type": "array",
@@ -678,7 +679,7 @@ const TOOL = {
           },
           "minItems": 2,
           "maxItems": 2,
-          "description": "(x, y): The starting coordinates for `left_click_drag`."
+          "description": "Where `left_click_drag` puts the button down, as [x, y] in viewport pixels; `coordinate` or `ref` supplies the point where it lifts again. Optional - leave it out and the drag begins wherever the previous action left the pointer, which is only predictable when that action was one of yours."
         },
         "region": {
           "type": "array",
@@ -687,29 +688,29 @@ const TOOL = {
           },
           "minItems": 4,
           "maxItems": 4,
-          "description": "(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."
+          "description": "Crop box for `zoom`, required by it and read by nothing else: [x0, y0, x1, y1] in viewport pixels, top-left corner first and bottom-right second. x1 has to exceed x0 and y1 exceed y0, and the whole box must fit inside the viewport. What comes back is that rectangle at capture resolution, which is what makes a 16-pixel icon or a line of fine print legible."
         },
         "repeat": {
           "type": "number",
           "minimum": 1,
           "maximum": 100,
-          "description": "Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times."
+          "description": "How many times to replay the whole sequence in `text`: a whole number from 1 to 100, and 1 when you leave it out. Only the `key` action looks at it. One call carrying repeat 20 beats twenty calls when you are walking a list with ArrowDown or emptying a field with Backspace."
         },
         "ref": {
           "type": "string",
-          "description": "Element reference ID from read_page or find tools (e.g., \"ref_1\", \"ref_2\"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions."
+          "description": "Element handle from an earlier read_page or find call, written like \"ref_1\". `scroll_to` requires one and accepts nothing else. For clicks, hover, drag and scroll it stands in for `coordinate`, and it is the sturdier of the two: the element is looked up and scrolled into view at the moment the call runs. With `type` it means \"click this field first, then type into it\". Handles expire with the snapshot that produced them - navigate, or let the page re-render, and you need fresh ones. A handle that resolves to something hidden (a closed menu, an inactive tab panel) comes back as an error instead of a click at the page origin."
         },
         "modifiers": {
           "type": "string",
-          "description": "Modifier keys for click actions. Supports: \"ctrl\", \"shift\", \"alt\", \"cmd\" (or \"meta\"), \"win\" (or \"windows\"). Can be combined with \"+\" (e.g., \"ctrl+shift\", \"cmd+alt\"). Optional."
+          "description": "Keys held down for the length of a pointer action - the four clicks, hover and drag all honour it. Name one of ctrl, shift, alt, cmd (or meta) or win (or windows), and join several with \"+\" when you need more than one, as in \"ctrl+shift\". This is how you shift-click a range or cmd-click a link into its own tab. Optional, and unrelated to the chords the `key` action parses out of `text`."
         },
         "tabId": {
           "type": "number",
-          "description": "Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+          "description": "The tab this action is performed on, from the tab group this session owns. The schema marks it required: tabs_context_mcp lists the ids that exist, tabs_create_mcp returns the id of a tab it opens, and a page opened from a tab already in the group joins it. An id from outside the group is rejected."
         },
         "save_to_disk": {
           "type": "boolean",
-          "description": "For screenshot/zoom actions: save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image \u2014 screenshots you're just looking at don't need saving."
+          "description": "Only meaningful for `screenshot` and `zoom`: set it true to also write the captured image into the firefox-use downloads folder, and the result line will carry the file path so you can attach it to a message. The picture is returned in the response either way, so leave this off while you are merely looking at the page yourself."
         }
       },
       "required": [

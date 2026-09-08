@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 *.log
+
+# Generated locally by scripts/extract-chrome-spec.js; never committed.
+.spec/

@@ -9,17 +9,30 @@
 
 const NESTED = 'browser_batch cannot be nested.';
 
-// Verbatim Chrome wording, minus the sentence about the extension's per-domain
-// permission gate: firefox-use has no such check to run per item.
+// The schema below is the Chrome contract - same tool name, same {name, input}
+// item shape, same minItems - so a batch written for one browser runs on the
+// other. The wording is ours, and it says what firefox-use actually does: there
+// is no per-domain permission gate to run between items here.
 const TOOL = {
   name: 'browser_batch',
   description:
-    'Execute a sequence of browser tool calls in ONE round trip. Each item is {name, input} where input is '
-    + "exactly what you'd pass to that tool standalone. Actions execute SEQUENTIALLY (not in parallel) and stop "
-    + 'on the first error. Use this tool extensively to quickly execute work whenever you can predict two or more '
-    + 'steps ahead \u2014 e.g. navigate, click a field, type, press Return, screenshot. Screenshots and other images '
-    + 'are returned interleaved with outputs; coordinates you write in THIS batch refer to the screenshot taken '
-    + 'BEFORE this call. browser_batch cannot be nested.',
+    'Push a whole run of browser tool calls through one request rather than spending a turn on each. '
+    + 'Every entry is {name, input}, where input is the same object you would hand that tool on its own. '
+    + 'Entries run one after another, never in parallel, and the run halts at the first failure: you get the '
+    + 'output of everything that finished, the error from the entry that broke, and a count of the entries '
+    + 'that never started. The list is checked before anything touches the page, so an unknown tool name, or '
+    + 'an attempt to put browser_batch inside itself, rejects the call outright instead of half-applying it. '
+    + 'Batch aggressively whenever you can see two or more moves ahead - open the page, click into the '
+    + 'search box, type the query, press Return, take a screenshot. Images come back inline among the text '
+    + 'outputs, each labelled with the entry that produced it. Two things bite here. First, any coordinate '
+    + 'you write in these entries, and any ref you name, come from a screenshot taken BEFORE the call or a '
+    + 'read_page that ran before it, since nothing this batch paints is visible to you while you compose it '
+    + '- and once an entry navigates or reloads, every earlier ref and coordinate is stale, so end the batch '
+    + 'there and look again. Second, every entry that acts on a page has to state tabId - inside a '
+    + 'batch no tab is inferred, so a batch that creates a tab and then drives it must repeat that new id on '
+    + 'each later entry. Unlike the Chrome extension, firefox-use runs no per-site permission check between '
+    + 'entries; it drives its own automation profile. A modal dialog does still freeze the page, so clear it '
+    + 'with firefox_dialog rather than letting the rest of the batch queue up behind it.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -31,19 +44,25 @@ const TOOL = {
           properties: {
             name: {
               type: 'string',
-              description: 'Tool name (e.g. computer, navigate, find, tabs_create_mcp). browser_batch cannot be nested.',
+              description:
+                'Which tool this entry calls, spelled exactly as it is registered - computer, navigate, find, '
+                + 'read_page, tabs_create_mcp and the rest. Naming browser_batch here is refused up front, '
+                + 'because a batch may not contain another batch.',
             },
             input: {
               type: 'object',
-              description: "That tool's input \u2014 same shape you'd pass when calling it directly.",
+              description:
+                'The arguments for that tool, shaped exactly as they would be in a standalone call; pass {} '
+                + 'for a tool that takes none. Anything that acts on a page needs its tabId given here.',
             },
           },
           required: ['name', 'input'],
         },
         description:
-          'List of tool calls to execute sequentially. Example: [{"name":"computer","input":{"action":"left_click",'
-          + '"coordinate":[100,200],"tabId":123}},{"name":"computer","input":{"action":"type","text":"hello",'
-          + '"tabId":123}},{"name":"navigate","input":{"url":"https://example.com","tabId":123}}]',
+          'The ordered calls to make, one or more, run from the top down. Example: '
+          + '[{"name":"navigate","input":{"tabId":7,"url":"https://docs.example.org/search"}},'
+          + '{"name":"computer","input":{"tabId":7,"coordinate":[420,260],"action":"left_click"}},'
+          + '{"name":"computer","input":{"tabId":7,"text":"budget report","action":"type"}}]',
       },
     },
     required: ['actions'],

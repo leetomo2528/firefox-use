@@ -42,17 +42,64 @@ const HIDDEN_REF = {
   width: 0, height: 0, inViewport: true, tag: 'button',
 };
 
-test('the tool definition is the Chrome spec verbatim', () => {
-  const spec = require('../docs/chrome-tool-spec.json').find((t) => t.name === 'computer');
+// The Chrome reference is generated from a local Claude Code install and is
+// never committed: `npm run spec` writes .spec/chrome-tool-spec.json. Without
+// it the comparisons below skip; everything else in this file still runs.
+const SPEC_PATH = path.join(__dirname, '..', '.spec', 'chrome-tool-spec.json');
+const SPEC = fs.existsSync(SPEC_PATH) ? JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8')) : null;
+const skipSpec = SPEC ? false : 'run `npm run spec` to generate .spec/chrome-tool-spec.json';
+
+// Schema shape without any prose: the structure is what has to interoperate,
+// the wording is ours to write.
+function schemaShape(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(schemaShape);
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'description') continue;
+    out[key] = schemaShape(value);
+  }
+  return out;
+}
+
+test('the tool is registered with the action enum we implement', () => {
   const [tool] = tools(fakeCtx(new FakeSession()));
   assert.equal(tool.name, 'computer');
-  assert.equal(tool.description, spec.description);
-  assert.deepStrictEqual(tool.inputSchema, spec.inputSchema);
+  assert.equal(typeof tool.handler, 'function');
   assert.deepStrictEqual(TOOL.inputSchema.properties.action.enum, [
     'left_click', 'right_click', 'type', 'screenshot', 'wait', 'scroll', 'key',
     'left_click_drag', 'double_click', 'triple_click', 'zoom', 'scroll_to', 'hover',
   ]);
-  assert.equal(typeof tool.handler, 'function');
+  assert.deepStrictEqual(TOOL.inputSchema.required, ['action', 'tabId']);
+  // Every parameter carries prose of its own; the model reads nothing else.
+  for (const [prop, def] of Object.entries(TOOL.inputSchema.properties)) {
+    assert.ok(
+      typeof def.description === 'string' && def.description.trim().length >= 10,
+      `computer.${prop} needs a description`
+    );
+  }
+});
+
+test('the schema shape matches Chrome, the prose does not', { skip: skipSpec }, () => {
+  const spec = SPEC.find((t) => t.name === 'computer');
+  const [tool] = tools(fakeCtx(new FakeSession()));
+  assert.ok(spec, 'the reference has no computer tool');
+  assert.deepStrictEqual(
+    schemaShape(tool.inputSchema),
+    schemaShape(spec.inputSchema),
+    'properties, types, enums, required and limits must match Chrome exactly'
+  );
+  assert.notEqual(
+    tool.description.trim(), spec.description.trim(),
+    'the tool description is copied from Claude Code - write it in our own words'
+  );
+  for (const [prop, def] of Object.entries(spec.inputSchema.properties || {})) {
+    if (!def.description) continue;
+    assert.notEqual(
+      tool.inputSchema.properties[prop].description.trim(), def.description.trim(),
+      `computer.${prop}: parameter text is copied verbatim - rewrite it`
+    );
+  }
 });
 
 test('left_click sends one pointer source: move, down, pause, up', async () => {

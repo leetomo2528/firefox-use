@@ -776,35 +776,60 @@ function tools(ctx) {
     {
       name: 'read_page',
       description:
-        'Get an accessibility tree representation of elements on the page. By default returns all ' +
-        'elements including non-visible ones. Output is limited to 50000 characters by default. If ' +
-        'the output exceeds this limit it is truncated at a line boundary, with a note giving the ' +
-        'full size \u2014 pass a larger max_chars, or use depth/ref_id to focus on part of the page. ' +
-        'Optionally filter for only interactive elements. If you don\'t have a valid tab ID, use ' +
-        'tabs_context_mcp first to get available tabs.',
+        'Dump a loaded page as an indented accessibility tree: one line per element carrying its role, ' +
+        'accessible name, state, its viewport box when it has one, and a ref_N handle, which is what ' +
+        'computer, form_input and the other element tools take as a target. Everything is listed by ' +
+        'default, including elements scrolled out of view or hidden by CSS; pass filter "interactive" ' +
+        'to keep only the controls. The walk stops 15 DOM levels below the body unless depth raises ' +
+        'it, gives up after 5000 elements, and the rendered text is trimmed to 50000 characters ' +
+        '(max_chars) on a line break so that no handle is cut in half - whenever any of those three ' +
+        'fires, a bracketed note at the end names the limit that hit, how much of the whole you got ' +
+        'and how to reach the rest. Handles are minted per document: after a navigation or a reload the ' +
+        'old ones stop resolving, so read the page again instead of reusing them. tabId is required ' +
+        '(tabs_context_mcp or firefox_status lists the ids this session owns), and a step inside ' +
+        'browser_batch has to carry it too. Firefox specifics: the browser runs in its own automation ' +
+        'profile, so nothing asks you to approve a site, but an open alert or confirm freezes the page ' +
+        'until firefox_dialog answers it.',
       inputSchema: {
         type: 'object',
         properties: {
           filter: {
             type: 'string',
             enum: ['interactive', 'all'],
-            description: 'Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)',
+            description:
+              '"interactive" keeps only what a person can operate - links, buttons, form fields, and ' +
+              'anything carrying a click handler, tabindex or an interactive ARIA role. The default, ' +
+              '"all", lists every element plus the page\'s text runs, hidden and off-screen ones ' +
+              'included, which is what you want when you are working out the layout rather than acting on it.',
           },
           tabId: {
             type: 'number',
-            description: 'Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don\'t have a valid tab ID.',
+            description:
+              'Required: the session tab to walk. Ids come from tabs_context_mcp or firefox_status; a ' +
+              'tab outside this session\'s group, or one already closed, is refused rather than guessed. ' +
+              'State it explicitly on a browser_batch step.',
           },
           depth: {
             type: 'number',
-            description: 'Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large.',
+            description:
+              'How many DOM levels below the body the listing may descend, 15 when omitted. Anything ' +
+              'further down is skipped and reported in a closing note - lower it to cut a bulky page ' +
+              'down to its skeleton, raise it when the control you want sits deeper than the walk reached.',
           },
           ref_id: {
             type: 'string',
-            description: 'Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large.',
+            description:
+              'Read one subtree instead of the whole document: give a handle from an earlier read_page ' +
+              'or find and you get that element together with all of its descendants. This is the usual ' +
+              'fix when a full read overflowed - focus on the form, table or card you care about. A ' +
+              'handle from before the last navigation is gone and comes back as an error.',
           },
           max_chars: {
             type: 'number',
-            description: 'Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs.',
+            description:
+              'Upper bound on the rendered output, 50000 characters when omitted. The cut falls on a ' +
+              'line boundary and the trailing note reports how much of the total you got. Raise it when ' +
+              'your client can swallow a big payload; otherwise prefer narrowing with depth or ref_id.',
           },
         },
         required: ['tabId'],
@@ -814,21 +839,37 @@ function tools(ctx) {
     {
       name: 'find',
       description:
-        'Find elements on the page using natural language. Can search for elements by their purpose ' +
-        '(e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). ' +
-        'Returns up to 20 matching elements with references that can be used with other tools. If ' +
-        'more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t ' +
-        'have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+        'Look up elements by describing them in ordinary language instead of by selector: "the search box ' +
+        'at the top", "whatever button adds this to a cart", "the heading that mentions pricing". ' +
+        'Scoring runs over the same tree read_page ' +
+        'builds - accessible names, an element\'s own text, and attributes such as id, name, ' +
+        'placeholder, title and href - with extra weight for a handful of intents (search, login, cart, ' +
+        'menu, close, submit, dropdown, checkbox, heading). Results come back ranked, best first, each ' +
+        'with the ref_N handle the action tools need, and at most 20 are printed; when more than that ' +
+        'matched, the output tells you to describe the target more tightly. The search reaches 30 levels ' +
+        'deep and the first 5000 elements walked, and it says so when it stopped short - so an empty ' +
+        'result on a huge page means widen the net with read_page, not that the element is absent. ' +
+        'query and tabId are both required, and handles expire with the document, so run find again ' +
+        'after any navigation; a browser_batch step must state the id itself. As everywhere on this ' +
+        'server the automation profile skips any per-site approval step, while an unanswered alert or ' +
+        'confirm holds the page until firefox_dialog clears it.',
       inputSchema: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")',
+            description:
+              'Describe the target the way you would to a person: by its job ("login button", "the ' +
+              'search field in the header") or by wording visible on it ("Add to cart", "organic ' +
+              'mango"). A few concrete words beat a full sentence; filler such as "the", "please" and ' +
+              '"click" is dropped before matching.',
           },
           tabId: {
             type: 'number',
-            description: 'Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don\'t have a valid tab ID.',
+            description:
+              'Required: the session tab to search. Ask tabs_context_mcp or firefox_status for valid ' +
+              'ids; only the tabs this session owns are addressable, and a browser_batch step must ' +
+              'spell the id out.',
           },
         },
         required: ['query', 'tabId'],
@@ -838,15 +879,26 @@ function tools(ctx) {
     {
       name: 'get_page_text',
       description:
-        'Extract raw text content from the page, prioritizing article content. Ideal for reading ' +
-        'articles, blog posts, or other text-heavy pages. Returns plain text without HTML ' +
-        'formatting. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+        'Read a page as prose: plain text, no markup, no element handles. The extractor takes the ' +
+        'article bodies when the page has real ones, otherwise <main>, otherwise the block with the ' +
+        'best text-to-markup ratio, falling back to the body, and throws away navigation, banners, ' +
+        'footers, sidebars, toolbars, select menus, iframes and anything marked hidden or aria-hidden, ' +
+        'so a long post arrives as paragraphs rather than as the furniture around them. Reach for it ' +
+        'when the goal is to read or quote; reach for read_page or find when you need something ' +
+        'clickable, since nothing here carries a ref. Output stops at 200000 characters, cut on a line ' +
+        'break, and the closing note reports how long the page actually was - only a pathological page ' +
+        'ever hits that. tabId is required, must name a tab this session owns, and has to be spelled ' +
+        'out on a browser_batch step. A modal alert or confirm blocks the read until firefox_dialog ' +
+        'answers it; no site approval is asked for, since the browser runs in its own profile.',
       inputSchema: {
         type: 'object',
         properties: {
           tabId: {
             type: 'number',
-            description: 'Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don\'t have a valid tab ID.',
+            description:
+              'Required: the tab whose readable text you want. Valid ids come from tabs_context_mcp or ' +
+              'firefox_status; tabs outside this session\'s group cannot be read, and a browser_batch ' +
+              'step has to name the id itself.',
           },
         },
         required: ['tabId'],
