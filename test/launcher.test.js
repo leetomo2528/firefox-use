@@ -52,3 +52,38 @@ test('a dead pid is never reported alive', () => {
 test('a closed port probes as closed', async () => {
   assert.equal(await launcher.probePort(1, '127.0.0.1', 200), false);
 });
+
+test('macOS tries launchd first and keeps a direct spawn in reserve', () => {
+  assert.deepEqual(launcher.launchPlan('darwin', '/Applications/Firefox.app'), ['open', 'direct']);
+  // A Mac without an .app bundle (a binary somewhere else) has nothing to hand launchd.
+  assert.deepEqual(launcher.launchPlan('darwin', null), ['direct']);
+  assert.deepEqual(launcher.launchPlan('linux', null), ['direct']);
+  assert.deepEqual(launcher.launchPlan('win32', null), ['direct']);
+});
+
+test('waitForPort gives up on a direct spawn that died', async () => {
+  const dead = { pid: 999999 };
+  const note = {};
+  const ok = await launcher.waitForPort(1, {
+    deadline: Date.now() + 3000,
+    child: dead,
+    kind: 'direct',
+    note,
+  });
+  assert.equal(ok, false);
+  assert.equal(note.exited, true, 'reports why it stopped waiting');
+});
+
+test('waitForPort keeps waiting for open, whose exit says nothing', async () => {
+  const started = Date.now();
+  const note = {};
+  const ok = await launcher.waitForPort(1, {
+    deadline: Date.now() + 600,
+    child: { pid: 999999 },
+    kind: 'open',
+    note,
+  });
+  assert.equal(ok, false);
+  assert.equal(note.exited, undefined);
+  assert.ok(Date.now() - started >= 500, 'waited for the deadline instead of the child');
+});

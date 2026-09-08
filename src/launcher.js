@@ -142,6 +142,41 @@ function firefoxArgs({ profile, port, headless, url }) {
   return args;
 }
 
+// macOS tries launchd first because a shell-parented Firefox is denied its own
+// profile there; the direct spawn behind it covers a Mac with no desktop
+// session (CI) and every other platform.
+function launchPlan(platform, bundle) {
+  return platform === 'darwin' && bundle ? ['open', 'direct'] : ['direct'];
+}
+
+// One way of starting Firefox. `open` hands the launch to launchd, which is
+// what macOS needs for the browser to reach its own profile; a direct spawn is
+// what works everywhere else - and on a Mac with no GUI session (CI), where
+// `open` has no launchd session to hand anything to.
+function startAttempt(kind, { bin, bundle, args, log }) {
+  if (kind === 'open') {
+    return spawn('/usr/bin/open', ['-n', '-a', bundle, '--args', ...args], {
+      detached: true,
+      stdio: ['ignore', log, log],
+    });
+  }
+  return spawn(bin, [...args, '--no-remote'], { detached: true, stdio: ['ignore', log, log] });
+}
+
+async function waitForPort(port, { deadline, child, kind, note }) {
+  while (Date.now() < deadline) {
+    if (await probePort(port)) return true;
+    // A direct spawn that died has nothing left to wait for. `open` exits as
+    // soon as it has asked launchd, so its exit says nothing either way.
+    if (kind === 'direct' && child && !pidAlive(child.pid) && !findPidForPort(port)) {
+      note.exited = true;
+      return false;
+    }
+    await sleep(200);
+  }
+  return false;
+}
+
 async function launch(opts = {}) {
   const port = opts.port || DEFAULT_PORT;
   const profile = opts.profile || process.env.FIREFOX_USE_PROFILE || DEFAULT_PROFILE;
@@ -154,46 +189,51 @@ async function launch(opts = {}) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
   const args = firefoxArgs({ profile, port, headless, url: opts.url });
-  const logStart = fs.existsSync(LOG_FILE) ? fs.statSync(LOG_FILE).size : 0;
-  const log = fs.openSync(LOG_FILE, 'a');
-  fs.writeSync(log, `\n--- ${new Date().toISOString()} launch ${bin} ${args.join(' ')}\n`);
-
   const bundle = process.platform === 'darwin' ? appBundleFor(bin) : null;
-  let child;
-  if (bundle) {
-    // macOS protects an application's support directory, and a Firefox started
-    // as a child of the shell inherits the shell's (denied) permissions, so it
-    // dies with "Could not find profile folder". `open` hands the launch to
-    // launchd, where Firefox runs under its own identity.
-    child = spawn('/usr/bin/open', ['-n', '-a', bundle, '--args', ...args], {
-      detached: true,
-      stdio: ['ignore', log, log],
-    });
-  } else {
-    child = spawn(bin, [...args, '--no-remote'], { detached: true, stdio: ['ignore', log, log] });
-  }
-  child.unref();
-  fs.closeSync(log);
+  // macOS tries launchd first because a shell-parented Firefox is denied its
+  // profile there; if nothing answers, a direct spawn still covers a Mac
+  // without a desktop session.
+  const plan = launchPlan(process.platform, bundle);
+  const total = opts.timeout || 45000;
+  const overall = Date.now() + total;
+  const failures = [];
 
-  const deadline = Date.now() + (opts.timeout || 45000);
-  let reachable = false;
-  while (Date.now() < deadline) {
-    if (await probePort(port)) { reachable = true; break; }
-    if (!bundle && !pidAlive(child.pid)) {
-      throw new Error(`Firefox exited during startup. See ${LOG_FILE}`);
+  for (let i = 0; i < plan.length; i++) {
+    const kind = plan[i];
+    const last = i === plan.length - 1;
+    const logStart = fs.existsSync(LOG_FILE) ? fs.statSync(LOG_FILE).size : 0;
+    const log = fs.openSync(LOG_FILE, 'a');
+    fs.writeSync(log, `\n--- ${new Date().toISOString()} launch (${kind}) ${bin} ${args.join(' ')}\n`);
+    const child = startAttempt(kind, { bin, bundle, args, log });
+    child.unref();
+    fs.closeSync(log);
+
+    // A first attempt gets a slice of the budget so a second one can still run.
+    const deadline = last ? overall : Math.min(overall, Date.now() + Math.min(15000, total / 2));
+    const note = {};
+    if (await waitForPort(port, { deadline, child, kind, note })) {
+      const url = scanLogForUrl(logStart) || `ws://127.0.0.1:${port}`;
+      const pid = kind === 'open' ? findPidForPort(port) : child.pid;
+      const state = { pid, port, url, profile, headless, bin, startedAt: new Date().toISOString(), launchedVia: kind };
+      writeState(state);
+      return state;
     }
-    await sleep(200);
-  }
-  if (!reachable) {
-    const tail = scanLogTail(logStart);
-    throw new Error(`Firefox did not open the BiDi port ${port} in time.${tail ? ` Log: ${tail}` : ''} See ${LOG_FILE}`);
+    failures.push(`${kind}: ${note.exited ? 'the process exited' : 'the port stayed closed'}`);
+    if (!last) {
+      // Do not leave a half-started browser fighting the next attempt.
+      const stray = findPidForPort(port);
+      if (stray) {
+        try { process.kill(stray, 'SIGTERM'); } catch { /* already gone */ }
+        await sleep(500);
+      }
+    }
   }
 
-  const url = scanLogForUrl(logStart) || `ws://127.0.0.1:${port}`;
-  const pid = bundle ? findPidForPort(port) : child.pid;
-  const state = { pid, port, url, profile, headless, bin, startedAt: new Date().toISOString() };
-  writeState(state);
-  return state;
+  const tail = scanLogTail(0);
+  throw new Error(
+    `Firefox did not open the BiDi port ${port} in time (${failures.join('; ')}).` +
+    `${tail ? ` Log: ${tail}` : ''} See ${LOG_FILE}`
+  );
 }
 
 async function status() {
@@ -246,6 +286,6 @@ function sessionUrl(base) {
 module.exports = {
   STATE_DIR, STATE_FILE, LOG_FILE, DEFAULT_PROFILE, DEFAULT_PORT,
   findFirefox, readState, writeState, pidAlive, probePort, ensureProfile,
-  appBundleFor, firefoxArgs, findPidForPort, scanLogForUrl,
+  appBundleFor, firefoxArgs, findPidForPort, scanLogForUrl, startAttempt, waitForPort, launchPlan,
   launch, status, ensureRunning, stop, sessionUrl,
 };
