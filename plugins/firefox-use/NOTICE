@@ -1,0 +1,21 @@
+firefox-use
+Copyright (c) 2026 Yunje Lee
+
+An independent project. Not affiliated with, endorsed by, or supported by
+Mozilla or Anthropic.
+
+Claude Code ships a browser integration for Chrome. firefox-use exposes the
+same tool names and the same parameters for Firefox, so a browser task written
+for one runs on the other. Names and parameter shapes are an interface, and
+they are matched deliberately; the prose - every tool description, the skill,
+the documentation - is written for this project.
+
+Anthropic's own tool definitions are not redistributed here.
+`scripts/extract-chrome-spec.js` reads them out of the Claude Code install on
+your own machine to produce a local test fixture (`.spec/`, never committed),
+which `test/parity.test.js` compares our schemas against. Running it requires
+your own licensed copy of Claude Code, and nothing it produces leaves your
+machine.
+
+Firefox is a trademark of the Mozilla Foundation. Claude and Claude Code are
+trademarks of Anthropic.

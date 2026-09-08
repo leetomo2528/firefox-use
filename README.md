@@ -18,7 +18,8 @@ you: "log into the staging site and screenshot the dashboard"
 
 ## Install
 
-**As a Claude Code plugin** (brings the tools and the skill together):
+**As a Claude Code plugin** - the tools and the skill in one step, with the server bundled,
+so nothing is downloaded at install time:
 
 ```bash
 claude plugin marketplace add leetomo2528/firefox-use
