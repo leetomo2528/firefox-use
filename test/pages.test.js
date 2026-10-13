@@ -297,6 +297,15 @@ test('tabs_close_mcp closes a tab and notes when the group empties', async () =>
   assert.deepEqual(session.callsOf('closeTab').map((c) => c.args.tabId), [2, 1]);
 });
 
+test('tabs_close_mcp says so when Firefox kept its last tab and blanked it', async () => {
+  const session = sessionWith([{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }]);
+  const close = session.closeTab.bind(session);
+  session.closeTab = async (tabId) => { await close(tabId); return { kept: true }; };
+  const out = await tabsClose(session, { tabId: 1 });
+  assert.match(out, /^Closed tab 1\. It was the last tab in Firefox, which keeps that one open, so it was blanked to about:blank/);
+  assert.match(out, /The group is now empty/);
+});
+
 test('closing a tab outside the group uses the shared no-such-tab wording', async () => {
   const session = sessionWith([{ tabId: 1, context: 'ctx-1', url: 'https://a.test/' }]);
   await assert.rejects(

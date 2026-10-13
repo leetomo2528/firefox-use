@@ -343,10 +343,14 @@ async function tabsClose(session, { tabId } = {}) {
   const id = Number(tabId);
   if (!Number.isFinite(id)) throw new Error(NO_TAB(tabId));
   session.requireContext(id); // NO_TAB for anything outside this session's group
-  await session.closeTab(id);
+  const closed = await session.closeTab(id);
+  // Firefox never closes its own last tab; the session blanked it instead.
+  const kept = closed && closed.kept
+    ? ' It was the last tab in Firefox, which keeps that one open, so it was blanked to about:blank and will be reused by the next tab you open.'
+    : '';
   const tabs = await session.listTabs();
   if (!tabs.length) {
-    return `Closed tab ${id}. The group is now empty - call tabs_context_mcp with createIfEmpty: true (or tabs_create_mcp) to start a fresh one.`;
+    return `Closed tab ${id}.${kept} The group is now empty - call tabs_context_mcp with createIfEmpty: true (or tabs_create_mcp) to start a fresh one.`;
   }
   return `Closed tab ${id}. ${plural(tabs.length, 'tab')} left in the group: ${tabs.map((t) => t.tabId).join(', ')}.`;
 }
@@ -884,8 +888,9 @@ function tools(ctx) {
         + 'purpose. tabId is required, and has to be an id tabs_context_mcp reported: a tab from one of your '
         + 'own windows, or one that is already gone, is refused rather than quietly ignored. Ids are handed out '
         + 'in sequence and never reused, so a closed one stays invalid for the rest of the session. Shutting '
-        + 'the last remaining tab empties the group and Firefox drops it; a later tabs_context_mcp that passes '
-        + 'createIfEmpty, or any tabs_create_mcp, builds a fresh one.',
+        + 'the last remaining tab empties the group; a later tabs_context_mcp that passes createIfEmpty, or any '
+        + 'tabs_create_mcp, builds a fresh one. Firefox never closes its own final tab, so that one is blanked '
+        + 'to about:blank instead and reused for the next tab you ask for.',
       inputSchema: {
         type: 'object',
         properties: {

@@ -227,6 +227,68 @@ test('the parity surface drives a real page', { skip }, async (t) => {
   });
 });
 
+// The 2026-10 hang: Firefox outlived its last window, every tab request failed
+// inside Firefox, and firefox_restart then waited on itself forever. Each step
+// here must come back with an answer, never a hang.
+test('a closed window, a killed browser and a restart never wedge the server', { skip, timeout: 300000 }, async (t) => {
+  const { ToolHost } = require('../src/tools');
+  const { server, port } = await serveFixtures();
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-it-'));
+  // The pref lets page script close the last window, the way a person would.
+  await launcher.stop();
+  const host = new ToolHost({ headless: true, downloadDir, prefs: { 'dom.allow_scripts_to_close_windows': true } });
+  const call = (name, input) => host.callTool(name, input);
+  const firstTab = (text) => Number((text.match(/\[(\d+)\]/) || [])[1]);
+
+  t.after(async () => {
+    await host.close();
+    await launcher.stop();
+    server.close();
+    fs.rmSync(downloadDir, { recursive: true, force: true });
+  });
+
+  await t.test('closing the browser\'s last tab blanks it, and the next tab reuses it', async () => {
+    const tabId = firstTab(asText(await call('tabs_context_mcp', { createIfEmpty: true })));
+    await call('navigate', { tabId, url: `http://127.0.0.1:${port}/parity.html` });
+    const session = await host.session();
+    assert.equal((await session.topLevelContexts()).length, 1, 'starts with the one tab Firefox opened');
+
+    const closed = asText(await call('tabs_close_mcp', { tabId }));
+    assert.match(closed, /blanked to about:blank/);
+    const left = await session.topLevelContexts();
+    assert.equal(left.length, 1);
+    assert.equal(left[0].url, 'about:blank', 'the page is no longer running');
+
+    const again = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    assert.match(again, /about:blank/);
+    assert.equal((await session.topLevelContexts()).length, 1, 'reused, not a second tab');
+  });
+
+  await t.test('a window closed from outside does not break the next tab request', async () => {
+    const tabId = firstTab(asText(await call('tabs_context_mcp', { createIfEmpty: true })));
+    await call('javascript_tool', { action: 'javascript_exec', tabId, text: 'setTimeout(() => window.close(), 50); "closing"' });
+    await sleep(1500);
+    // macOS keeps Firefox running with no window (the TypeError case); Linux
+    // may quit it instead. Either way the call has to end with a usable tab.
+    const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    assert.ok(Number.isInteger(firstTab(out)), out);
+    assert.match(asText(await call('navigate', { tabId: firstTab(out), url: `http://127.0.0.1:${port}/parity.html` })), /parity\.html/);
+  });
+
+  await t.test('a browser killed mid-session is relaunched by the next call', async () => {
+    assert.equal(await launcher.stop({ force: true }), true);
+    const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    assert.ok(Number.isInteger(firstTab(out)), out);
+  });
+
+  await t.test('firefox_restart finishes and the server keeps answering', async () => {
+    assert.match(asText(await call('firefox_restart', {})), /Firefox restarted/);
+    assert.match(asText(await call('firefox_status', {})), /firefox: running/);
+    const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    assert.ok(Number.isInteger(firstTab(out)), out);
+  });
+});
+
 test('the MCP server exposes the parity surface over stdio', { skip }, async () => {
   const proc = spawn(process.execPath, [path.join(__dirname, '..', 'bin', 'firefox-use'), 'mcp'], {
     env: { ...process.env, FIREFOX_USE_HEADLESS: '1' },

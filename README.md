@@ -82,7 +82,8 @@ firefox-use mcp              # the MCP server on stdio (what Claude Code runs)
 
 Options: `--headless`, `--port <n>`, `--profile <dir>`.
 Environment: `FIREFOX_BIN`, `FIREFOX_USE_PORT`, `FIREFOX_USE_PROFILE`, `FIREFOX_USE_HEADLESS=1`,
-`FIREFOX_USE_DOWNLOADS`, `FIREFOX_USE_UPLOAD_ROOTS`, `FIREFOX_USE_AUTO_RESTART=0`.
+`FIREFOX_USE_DOWNLOADS`, `FIREFOX_USE_UPLOAD_ROOTS`, `FIREFOX_USE_AUTO_RESTART=0`,
+`FIREFOX_USE_CALL_TIMEOUT_MS` (the per-call limit, default 150000).
 
 ## How it works
 
@@ -118,6 +119,15 @@ Worth knowing:
   is gone rather than resolving to whatever now sits at that index.
 - **One automation session per browser.** The server closes its session on shutdown;
   `firefox_restart` clears one left behind by a crash.
+- **Nothing waits forever.** Every tool call has a deadline (150 s unless
+  `FIREFOX_USE_CALL_TIMEOUT_MS` says otherwise), and so does each step beneath it: launching,
+  connecting, every BiDi command. A call that runs out of time asks Firefox for a trivial
+  answer; if none comes, the connection is dropped and the next call reconnects or relaunches.
+- **A Firefox with no window is restarted.** On macOS Firefox keeps running after its last
+  window closes, and its `browsingContext.create` then fails with a TypeError whatever it is
+  asked for, so no tab can be opened. The next call that needs a tab restarts the browser and
+  says it did. Firefox also never closes its own final tab: `tabs_close_mcp` blanks that one to
+  `about:blank` and reuses it.
 
 ## Development
 

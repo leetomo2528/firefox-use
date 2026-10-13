@@ -114,6 +114,16 @@ or dismisses it, and `firefox_status` tells you which tab is blocked. Actions on
 tab fail immediately rather than hanging, so a fast failure with a dialog mentioned in it
 means: answer the dialog, then carry on.
 
+## When Firefox misbehaves
+
+Every call comes back, as a result or as an error that says what went wrong; none waits more
+than about two and a half minutes. A timeout says whether Firefox still answered a health
+check - if it did not, the connection was dropped and the next call reconnects, relaunching
+Firefox when it has to. Firefox can also end up running with no window at all (on macOS it
+stays alive after its last window is closed); the next call that needs a tab restarts it on
+its own and says so. For anything else that looks stuck, `firefox_restart` starts the browser
+again: logins kept in the profile survive it, open tabs do not.
+
 ## When to stop and ask
 
 Stop and check with the user when the task stops going forward:

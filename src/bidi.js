@@ -4,6 +4,16 @@
 const { EventEmitter } = require('events');
 const { WebSocket } = require('./ws');
 
+// A command or a connect attempt that ran out of time. Callers tell it apart
+// from a protocol error by err.code, and decide whether the browser is gone.
+class BidiTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BidiTimeoutError';
+    this.code = 'timeout';
+  }
+}
+
 class BidiError extends Error {
   constructor(payload) {
     super(payload.message || payload.error || 'BiDi error');
@@ -28,18 +38,24 @@ class BidiConnection extends EventEmitter {
   static connect(url, { timeout = 15000 } = {}) {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
+      let settled = false;
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(value);
+      };
       const timer = setTimeout(() => {
+        settle(reject, new BidiTimeoutError(`timed out connecting to ${url} after ${timeout}ms`));
         ws.close();
-        reject(new Error(`timed out connecting to ${url}`));
       }, timeout);
-      ws.once('open', () => {
-        clearTimeout(timer);
-        resolve(new BidiConnection(ws));
-      });
-      ws.once('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+      ws.once('open', () => settle(resolve, new BidiConnection(ws)));
+      // Swallow late errors: a socket that failed after the timeout must not
+      // surface as an unhandled 'error' event.
+      ws.on('error', (err) => settle(reject, err));
+      // A peer that hangs up during the handshake sends neither 'open' nor
+      // 'error'; without this the caller sat out the whole timeout.
+      ws.once('close', () => settle(reject, new Error(`${url} closed the connection during the handshake`)));
     });
   }
 
@@ -84,7 +100,7 @@ class BidiConnection extends EventEmitter {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(id);
-        reject(new Error(`BiDi command timed out: ${method}`));
+        reject(new BidiTimeoutError(`BiDi command timed out after ${timeout}ms: ${method}`));
       }, timeout);
       this._pending.set(id, { resolve, reject, timer });
       try {
@@ -105,4 +121,4 @@ class BidiConnection extends EventEmitter {
   }
 }
 
-module.exports = { BidiConnection, BidiError };
+module.exports = { BidiConnection, BidiError, BidiTimeoutError };

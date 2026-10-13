@@ -4,6 +4,10 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
+
+// stop() reads state.json; keep these tests away from a real one.
+process.env.FIREFOX_USE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-home-'));
 const launcher = require('../src/launcher');
 
 test('the session endpoint is appended exactly once', () => {
@@ -86,4 +90,63 @@ test('waitForPort keeps waiting for open, whose exit says nothing', async () => 
   assert.equal(ok, false);
   assert.equal(note.exited, undefined);
   assert.ok(Date.now() - started >= 500, 'waited for the deadline instead of the child');
+});
+
+test('extra preferences are written for one launch only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-'));
+  const dir = path.join(root, 'profile');
+  try {
+    launcher.ensureProfile(dir, { 'dom.allow_scripts_to_close_windows': true });
+    assert.match(fs.readFileSync(path.join(dir, 'user.js'), 'utf8'), /dom\.allow_scripts_to_close_windows", true/);
+    launcher.ensureProfile(dir);
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, 'user.js'), 'utf8'), /allow_scripts_to_close_windows/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the port pattern does not match a longer port number', () => {
+  const re = new RegExp(launcher.portPattern(9222));
+  assert.ok(re.test('/x/firefox --profile /p --remote-debugging-port 9222 about:blank'));
+  assert.ok(re.test('/x/firefox --remote-debugging-port 9222'));
+  assert.ok(!re.test('/x/firefox --remote-debugging-port 92220 about:blank'));
+});
+
+// A stand-in process whose command line carries the flag a launched Firefox
+// has. `name` is the executable it runs as (a symlink to node).
+const FAKE_BIN = fs.mkdtempSync(path.join(os.tmpdir(), 'ffuse-bin-'));
+function fakeProcess(name, port) {
+  const exe = path.join(FAKE_BIN, name);
+  if (!fs.existsSync(exe)) fs.symlinkSync(process.execPath, exe);
+  const child = spawn(exe, ['-e', 'setInterval(() => {}, 1000)', '--', '--remote-debugging-port', String(port)], {
+    stdio: 'ignore',
+  });
+  return new Promise((resolve) => setTimeout(() => resolve(child), 300));
+}
+
+test('stop ends the browser on our port, and nothing else that mentions it', async (t) => {
+  const port = 40000 + Math.floor(Math.random() * 20000);
+  const ours = await fakeProcess('firefox', port);
+  const lookalike = await fakeProcess('firefox', `${port}0`);
+  // A shell or grep whose arguments happen to carry the flag.
+  const bystander = await fakeProcess('not-a-browser', port);
+  t.after(() => { for (const p of [ours, lookalike, bystander]) p.kill('SIGKILL'); });
+
+  assert.equal(launcher.isOurFirefox(ours.pid, port), true);
+  assert.equal(launcher.isOurFirefox(lookalike.pid, port), false);
+  assert.equal(launcher.isOurFirefox(process.pid, port), false, 'a live pid that is not ours');
+  assert.deepEqual(launcher.findPidsForPort(port), [ours.pid]);
+
+  // No state.json names it: stop finds it by the port alone.
+  assert.equal(await launcher.stop({ port }), true);
+  assert.equal(launcher.pidAlive(ours.pid), false);
+  assert.equal(launcher.pidAlive(lookalike.pid), true);
+  assert.equal(launcher.pidAlive(bystander.pid), true);
+  assert.equal(await launcher.stop({ port }), false, 'nothing left to stop');
+});
+
+test('stop never signals a recycled pid from a stale state file', async () => {
+  // state.json says Firefox is this test process: alive, but not ours.
+  launcher.writeState({ pid: process.pid, port: 1, url: 'ws://127.0.0.1:1' });
+  assert.equal(await launcher.stop({ port: 1 }), false);
 });

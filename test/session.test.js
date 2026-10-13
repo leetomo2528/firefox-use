@@ -297,3 +297,134 @@ test('a reloaded document mints refs from a fresh block, so stale refs miss', as
   assert.equal(seeds.length, 2, 'installed once per document');
   assert.ok(seeds[1] > seeds[0] + 1000, `the new document starts well past the old ids (${seeds.join(' -> ')})`);
 });
+
+// --- windowless Firefox, the browser's last tab, unresponsive browsers -------
+
+const { NO_WINDOW } = require('../src/session');
+const { BidiError } = require('../src/bidi');
+const launcher = require('../src/launcher');
+const bidi = require('../src/bidi');
+
+const WINDOWLESS_TYPEERROR = 'TypeError: can\'t access property "selectedTab", lazy.TabManager.getTabBrowser(...) is null';
+
+test('creating a tab in a Firefox with no window fails with a typed, explained error', async () => {
+  const { session } = sessionWith({
+    'browsingContext.getTree': { contexts: [] },
+    'browsingContext.create': () => { throw new BidiError({ error: 'unknown error', message: WINDOWLESS_TYPEERROR }); },
+  });
+  await assert.rejects(session.createTab(), (err) => {
+    assert.equal(err.code, NO_WINDOW);
+    assert.match(err.message, /without any browser window/);
+    assert.match(err.cause.message, /getTabBrowser/);
+    assert.equal(err.session, session);
+    return true;
+  });
+});
+
+test('a create error with windows still open is passed through unchanged', async () => {
+  const { session } = sessionWith({
+    'browsingContext.create': () => { throw new BidiError({ error: 'unknown error', message: 'something else' }); },
+  });
+  await assert.rejects(session.createTab(), (err) => err.code === 'unknown error' && err.message === 'something else');
+});
+
+test('the browser\'s last tab is blanked when Firefox will not close it, then reused', async () => {
+  const { session, conn } = sessionWith();
+  const [tabId] = await session.adoptExistingTabs();
+  // Firefox answers browsingContext.close on its only tab with success and
+  // keeps the tab: getTree still lists it afterwards.
+  const out = await session.closeTab(tabId);
+  assert.deepEqual(out, { kept: true });
+  const nav = conn.lastOf('browsingContext.navigate');
+  assert.deepEqual(nav.params, { context: 'ctx-a', url: 'about:blank', wait: 'complete' });
+  assert.equal(session.tabs.size, 0, 'the tab left the group');
+  assert.deepEqual(await session.listTabs(), [], 'and is not adopted back');
+
+  const creates = conn.sent.filter((c) => c.method === 'browsingContext.create').length;
+  const reused = await session.createTab();
+  assert.equal(session.tabs.contextFor(reused), 'ctx-a', 'the parked tab is reused');
+  assert.equal(conn.sent.filter((c) => c.method === 'browsingContext.create').length, creates, 'no second tab');
+  assert.notEqual(reused, tabId, 'with a new id, so the old one stays dead');
+});
+
+test('a tab Firefox really closed is not parked', async () => {
+  const { session, conn } = sessionWith({
+    'browsingContext.getTree': [
+      { contexts: [{ context: 'ctx-a' }, { context: 'ctx-b' }] },
+      { contexts: [{ context: 'ctx-b' }] },
+    ],
+  });
+  const [first] = await session.adoptExistingTabs();
+  assert.deepEqual(await session.closeTab(first), { kept: false });
+  assert.equal(conn.lastOf('browsingContext.navigate'), undefined);
+});
+
+// Session.open against stubbed transport and launcher.
+function stubOpen(t, { connect, launch } = {}) {
+  const saved = {
+    connect: bidi.BidiConnection.connect,
+    ensureRunning: launcher.ensureRunning, launch: launcher.launch, stop: launcher.stop,
+  };
+  const log = { connects: 0, stop: 0, launch: 0 };
+  launcher.ensureRunning = async () => ({ url: 'ws://127.0.0.1:1', port: 1 });
+  launcher.stop = async () => { log.stop++; return true; };
+  launcher.launch = async () => { log.launch++; return (launch && launch()) || { url: 'ws://127.0.0.1:2', port: 2 }; };
+  bidi.BidiConnection.connect = async (url, opts) => { log.connects++; log.lastOpts = opts; return connect(log.connects, url); };
+  t.after(() => {
+    bidi.BidiConnection.connect = saved.connect;
+    Object.assign(launcher, { ensureRunning: saved.ensureRunning, launch: saved.launch, stop: saved.stop });
+  });
+  return log;
+}
+
+const timedOut = () => Object.assign(new Error('timed out connecting'), { code: 'timeout' });
+
+test('a browser that does not answer the connect is relaunched once', async (t) => {
+  const log = stubOpen(t, {
+    connect: (n) => {
+      if (n === 1) throw timedOut();
+      return new FakeConn({ 'browsingContext.getTree': { contexts: [{ context: 'ctx-a' }] } });
+    },
+  });
+  const session = await Session.open({});
+  assert.ok(session);
+  assert.equal(log.stop, 1);
+  assert.equal(log.launch, 1);
+  assert.ok(log.lastOpts.timeout <= 15000, 'connect is bounded');
+});
+
+test('a session.new that never answers counts as an unresponsive browser', async (t) => {
+  const hung = new FakeConn({ 'session.new': () => { throw timedOut(); } });
+  const log = stubOpen(t, {
+    connect: (n) => (n === 1 ? hung : new FakeConn({ 'browsingContext.getTree': { contexts: [] } })),
+  });
+  await Session.open({});
+  assert.equal(hung.closed, true);
+  assert.equal(log.launch, 1);
+  assert.ok(hung.lastOf('session.new').opts.timeout <= 15000, 'session.new is bounded');
+});
+
+test('with auto-restart off, an unresponsive browser is a clear error, not a hang', async (t) => {
+  stubOpen(t, { connect: () => { throw timedOut(); } });
+  await assert.rejects(
+    Session.open({ autoRestart: false }),
+    /not answering WebDriver BiDi \(timed out connecting\)\. Call firefox_restart/
+  );
+});
+
+test('a session held by another client is still reported as such', async (t) => {
+  const taken = () => new FakeConn({
+    'session.new': () => { throw new BidiError({ error: 'session not created', message: 'Maximum number of active sessions' }); },
+  });
+  const log = stubOpen(t, { connect: taken });
+  await assert.rejects(Session.open({ autoRestart: false }), /active WebDriver BiDi session that is not ours/);
+  assert.equal(log.launch, 0);
+});
+
+test('a protocol error during setup is not mistaken for a dead browser', async (t) => {
+  const log = stubOpen(t, {
+    connect: () => new FakeConn({ 'session.subscribe': () => { throw new BidiError({ error: 'invalid argument', message: 'bad event' }); } }),
+  });
+  await assert.rejects(Session.open({}), /bad event/);
+  assert.equal(log.launch, 0, 'no relaunch for an error a new browser would repeat');
+});

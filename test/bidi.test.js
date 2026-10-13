@@ -62,3 +62,56 @@ test('sending on a closed connection fails fast', async () => {
   conn.close();
   await assert.rejects(() => conn.send('session.status', {}), /closed/i);
 });
+
+const net = require('node:net');
+const { BidiTimeoutError } = require('../src/bidi');
+
+function tcpServer(onSocket) {
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    onSocket(socket);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      url: `ws://127.0.0.1:${server.address().port}`,
+      close: () => { for (const s of sockets) s.destroy(); server.close(); },
+    }));
+  });
+}
+
+test('a command that runs out of time rejects with a timeout code', async () => {
+  const { conn } = connect();
+  await assert.rejects(conn.send('script.evaluate', {}, { timeout: 20 }), (err) => {
+    assert.ok(err instanceof BidiTimeoutError);
+    assert.equal(err.code, 'timeout');
+    assert.match(err.message, /timed out after 20ms: script\.evaluate/);
+    return true;
+  });
+});
+
+test('connecting to a peer that hangs up mid-handshake fails at once', async () => {
+  // Reads the upgrade request, then hangs up without answering it.
+  const peer = await tcpServer((socket) => socket.once('data', () => socket.end()));
+  try {
+    const started = Date.now();
+    // A FIN arrives as a bare close; a reset would arrive as ECONNRESET first.
+    await assert.rejects(
+      BidiConnection.connect(peer.url, { timeout: 5000 }),
+      /closed the connection during the handshake|ECONNRESET/
+    );
+    assert.ok(Date.now() - started < 2000, 'did not sit out the connect timeout');
+  } finally {
+    peer.close();
+  }
+});
+
+test('connecting to a peer that never answers times out with a timeout code', async () => {
+  const peer = await tcpServer(() => { /* accept and say nothing, like a stopped browser */ });
+  try {
+    await assert.rejects(BidiConnection.connect(peer.url, { timeout: 150 }), (err) => err.code === 'timeout');
+  } finally {
+    peer.close();
+  }
+});

@@ -91,10 +91,12 @@ function probePort(port, host = '127.0.0.1', timeout = 500) {
   });
 }
 
-function ensureProfile(dir) {
+// `extra` adds preferences for one launch (tests use it for prefs a real
+// profile should not carry); it cannot be set from the environment.
+function ensureProfile(dir, extra = {}) {
   const fresh = !fs.existsSync(dir);
   fs.mkdirSync(dir, { recursive: true });
-  const lines = Object.entries(PREFS).map(
+  const lines = Object.entries({ ...PREFS, ...extra }).map(
     ([key, value]) => `user_pref("${key}", ${typeof value === 'string' ? value : JSON.stringify(value)});`
   );
   fs.writeFileSync(path.join(dir, 'user.js'), lines.join('\n') + '\n');
@@ -128,11 +130,44 @@ function appBundleFor(bin) {
   return i === -1 ? null : bin.slice(0, i + 4);
 }
 
+// Firefox processes this tool started for `port`, recognised by the flag on
+// their command line - an everyday Firefox, or one on another port, never matches.
+function portPattern(port) {
+  return `remote-debugging-port ${port}( |$)`;
+}
+
+function psField(pid, field) {
+  const res = spawnSync('ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf8', timeout: 5000 });
+  return res.status === 0 && res.stdout ? res.stdout.trim() : '';
+}
+
+// The executable has to be a browser too: a shell or a grep whose arguments
+// merely mention the flag must never be signalled.
+function isBrowserExecutable(pid) {
+  const configured = path.basename(process.env.FIREFOX_BIN || '');
+  // comm is the executable, unless the process renamed its main thread (Linux
+  // lets it); argv[0] is the name it was started under.
+  const names = [psField(pid, 'comm'), psField(pid, 'command').split(' ')[0]].map((n) => path.basename(n));
+  return names.some((exe) => exe && (/firefox/i.test(exe) || exe === configured));
+}
+
+function findPidsForPort(port) {
+  const res = spawnSync('pgrep', ['-f', portPattern(port)], { encoding: 'utf8', timeout: 5000 });
+  if (res.status !== 0 || !res.stdout) return [];
+  return res.stdout.trim().split(/\s+/).filter(Boolean).map(Number)
+    .filter((pid) => pid !== process.pid && isBrowserExecutable(pid));
+}
+
 function findPidForPort(port) {
-  const res = spawnSync('pgrep', ['-f', `remote-debugging-port ${port}`], { encoding: 'utf8' });
-  if (res.status !== 0) return null;
-  const pids = res.stdout.trim().split(/\s+/).filter(Boolean).map(Number);
+  const pids = findPidsForPort(port);
   return pids.length ? pids[pids.length - 1] : null;
+}
+
+// state.json can outlive its browser, and a pid can be recycled after a
+// reboot: only signal a pid whose command line still says it is ours.
+function isOurFirefox(pid, port) {
+  if (!pidAlive(pid)) return false;
+  return new RegExp(portPattern(port)).test(psField(pid, 'command'));
 }
 
 function firefoxArgs({ profile, port, headless, url }) {
@@ -185,7 +220,7 @@ async function launch(opts = {}) {
   if (!bin) {
     throw new Error('Firefox not found. Install it, or set FIREFOX_BIN to the firefox binary path.');
   }
-  ensureProfile(profile);
+  ensureProfile(profile, opts.prefs);
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
   const args = firefoxArgs({ profile, port, headless, url: opts.url });
@@ -261,20 +296,30 @@ async function ensureRunning(opts = {}) {
   return { ...state, launched: true };
 }
 
-async function stop({ force = false } = {}) {
+// Stops the browser this tool started: the pid on record if it is still ours,
+// plus anything else holding our port (a launch that lost track of its pid).
+// Returns once the processes are gone and the port is free, or after ~10s.
+async function stop({ force = false, port } = {}) {
   const state = readState();
-  if (!state?.pid || !pidAlive(state.pid)) return false;
-  try {
-    process.kill(state.pid, force ? 'SIGKILL' : 'SIGTERM');
-  } catch {
-    return false;
+  const target = port || state?.port || DEFAULT_PORT;
+  const pids = new Set(findPidsForPort(target));
+  if (state?.pid && isOurFirefox(state.pid, target)) pids.add(state.pid);
+  if (!pids.size) return false;
+  const signal = (sig) => {
+    for (const pid of pids) {
+      try { process.kill(pid, sig); } catch { /* already gone */ }
+    }
+  };
+  const alive = () => [...pids].some((pid) => pidAlive(pid));
+  signal(force ? 'SIGKILL' : 'SIGTERM');
+  for (let i = 0; i < 50 && alive(); i++) await sleep(100);
+  if (alive()) {
+    signal('SIGKILL');
+    for (let i = 0; i < 20 && alive(); i++) await sleep(100);
   }
-  for (let i = 0; i < 50 && pidAlive(state.pid); i++) await sleep(100);
-  if (pidAlive(state.pid)) {
-    try {
-      process.kill(state.pid, 'SIGKILL');
-    } catch { /* already gone */ }
-  }
+  // The listening socket can linger a moment after the process; a launch that
+  // probed it now would mistake the dying browser for the new one.
+  for (let i = 0; i < 20 && (await probePort(target, '127.0.0.1', 200)); i++) await sleep(100);
   return true;
 }
 
@@ -286,6 +331,6 @@ function sessionUrl(base) {
 module.exports = {
   STATE_DIR, STATE_FILE, LOG_FILE, DEFAULT_PROFILE, DEFAULT_PORT,
   findFirefox, readState, writeState, pidAlive, probePort, ensureProfile,
-  appBundleFor, firefoxArgs, findPidForPort, scanLogForUrl, startAttempt, waitForPort, launchPlan,
+  appBundleFor, firefoxArgs, findPidForPort, findPidsForPort, isOurFirefox, portPattern, scanLogForUrl, startAttempt, waitForPort, launchPlan,
   launch, status, ensureRunning, stop, sessionUrl,
 };

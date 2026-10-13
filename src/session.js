@@ -20,7 +20,38 @@ const EVENTS = [
   'log.entryAdded',
 ];
 
+// Setting up a session is a handful of small commands. A browser that cannot
+// answer them in this time is stuck, not busy.
+const CONNECT_TIMEOUT = 10000;
+const SETUP_TIMEOUT = 15000;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// On macOS Firefox outlives its last window. It still answers BiDi then, but
+// browsingContext.create reads the most recent window's tab strip before it
+// looks at `type`, so it fails with a TypeError whatever is asked for.
+const NO_WINDOW = 'no browser window';
+
+function noWindowError(cause) {
+  const err = new Error(
+    'Firefox is running without any browser window (macOS keeps it alive after its last window is '
+    + 'closed), and WebDriver BiDi cannot open a tab until one exists. Call firefox_restart to start it again.'
+  );
+  err.code = NO_WINDOW;
+  err.cause = cause;
+  return err;
+}
+
+function looksWindowless(err) {
+  return err?.code === 'unknown error' || /TabManager|selectedTab|BrowserWindow/.test(err?.message || '');
+}
+
+// The connection, not the request, is what failed: retrying on a new browser can help.
+function isUnresponsive(err) {
+  if (!err) return false;
+  if (err.code === 'timeout' || ['ECONNREFUSED', 'ECONNRESET', 'EPIPE'].includes(err.code)) return true;
+  return /closed the connection|connection closed|connection is closed/i.test(err.message || '');
+}
 
 // Chrome's wording, so failures read the same on either browser.
 const NO_TAB = (tabId) => `Tab ${tabId} no longer exists. Call tabs_context_mcp to get valid tab ids.`;
@@ -205,6 +236,7 @@ class Session {
     // resolve to a different element on the new page.
     this._refSeed = 1;
     this._prompts = new Map(); // context -> userPromptOpened params
+    this._parked = null; // the browser's last tab, blanked by closeTab
     if (opts.tabIds) this.tabs.seed(opts.tabIds);
 
     conn.on('event', (method, params) => this._dispatch(method, params));
@@ -223,40 +255,58 @@ class Session {
     conn.on('browsingContext.load', (p) => this._booted.delete(p.context));
   }
 
+  // Connects to the browser, launching it when nothing answers. Every step is
+  // bounded: a browser that holds someone else's session or has stopped
+  // answering is relaunched once (unless autoRestart is off), and anything
+  // left over becomes an error the caller can show.
   static async open(opts = {}) {
     const allowRestart = opts.autoRestart ?? process.env.FIREFOX_USE_AUTO_RESTART !== '0';
     let state = await launcher.ensureRunning(opts);
+    let relaunched = false;
     for (let attempt = 0; ; attempt++) {
-      const conn = await BidiConnection.connect(launcher.sessionUrl(state.url));
+      let conn = null;
       try {
-        const session = new Session(conn, opts);
-        session.state = state;
-        try {
-          const created = await conn.send('session.new', { capabilities: {} });
-          session.platform = created?.capabilities?.platformName || 'mac';
-          session.sessionId = created?.sessionId;
-        } catch (err) {
-          if (err.code === 'session not created') throw err;
-        }
-        await conn.send('session.subscribe', { events: EVENTS });
-        await session.adoptExistingTabs();
-        return session;
+        conn = await BidiConnection.connect(launcher.sessionUrl(state.url), { timeout: CONNECT_TIMEOUT });
+        return await Session._start(conn, state, opts);
       } catch (err) {
-        conn.close();
-        if (err.code !== 'session not created') throw err;
-        if (attempt === 0) { await sleep(1000); continue; }
-        if (attempt === 1 && allowRestart) {
-          await launcher.stop();
-          await sleep(1000);
+        if (conn) conn.close();
+        const taken = err.code === 'session not created';
+        if (!taken && !isUnresponsive(err)) throw err;
+        if (taken && attempt === 0) { await sleep(1000); continue; }
+        if (allowRestart && !relaunched) {
+          relaunched = true;
+          await launcher.stop({ port: state.port });
+          await sleep(500);
           state = await launcher.launch(opts);
           continue;
         }
+        if (taken) {
+          throw new Error(
+            'Firefox already has an active WebDriver BiDi session that is not ours. '
+            + 'Run `firefox-use restart` (or close Firefox) and try again.'
+          );
+        }
         throw new Error(
-          'Firefox already has an active WebDriver BiDi session that is not ours. ' +
-          'Run `firefox-use restart` (or close Firefox) and try again.'
+          `Firefox on port ${state.port} is not answering WebDriver BiDi (${err.message}). `
+          + 'Call firefox_restart, or run `firefox-use restart`.'
         );
       }
     }
+  }
+
+  static async _start(conn, state, opts) {
+    const session = new Session(conn, opts);
+    session.state = state;
+    try {
+      const created = await conn.send('session.new', { capabilities: {} }, { timeout: SETUP_TIMEOUT });
+      session.platform = created?.capabilities?.platformName || 'mac';
+      session.sessionId = created?.sessionId;
+    } catch (err) {
+      if (err.code === 'session not created' || isUnresponsive(err)) throw err;
+    }
+    await conn.send('session.subscribe', { events: EVENTS }, { timeout: SETUP_TIMEOUT });
+    await session.adoptExistingTabs();
+    return session;
   }
 
   async close({ endSession = true } = {}) {
@@ -301,7 +351,7 @@ class Session {
   // --- tabs ---------------------------------------------------------------
 
   async topLevelContexts() {
-    const { contexts } = await this.conn.send('browsingContext.getTree', {});
+    const { contexts } = await this.conn.send('browsingContext.getTree', {}, { timeout: SETUP_TIMEOUT });
     return contexts || [];
   }
 
@@ -359,6 +409,13 @@ class Session {
     // With every window closed there is no tab strip to add to, so the first
     // tab has to bring its own window.
     const existing = await this.topLevelContexts();
+    const parked = type === 'window' ? null : this._takeParked(existing);
+    if (parked) {
+      const tabId = this.tabs.add(parked.context);
+      await this.applyViewport(parked.context);
+      if (url) await this.navigate(tabId, url);
+      return tabId;
+    }
     const kind = type || (existing.length ? 'tab' : 'window');
     const params = { type: kind, focus: true };
     if (kind === 'tab') {
@@ -366,7 +423,18 @@ class Session {
         || existing[0]?.context;
       if (anchor) params.referenceContext = anchor;
     }
-    const { context } = await this.conn.send('browsingContext.create', params);
+    let created;
+    try {
+      created = await this.conn.send('browsingContext.create', params);
+    } catch (err) {
+      if (!existing.length && looksWindowless(err)) {
+        const windowless = noWindowError(err);
+        windowless.session = this; // lets the host tell a stale report from a current one
+        throw windowless;
+      }
+      throw err;
+    }
+    const { context } = created;
     const tabId = this.tabs.add(context);
     if (!this.tabs.windowContext) {
       const info = (await this.topLevelContexts()).find((c) => c.context === context);
@@ -377,10 +445,28 @@ class Session {
     return tabId;
   }
 
+  // Firefox answers a request to close the browser's very last tab with
+  // success and leaves the tab open (the spec leaves that case undefined).
+  // Such a tab is blanked, so its page stops running, and parked for the next
+  // createTab to reuse. Returns { kept } so the caller can say which it was.
   async closeTab(tabId) {
     const context = this.requireContext(tabId);
     await this.conn.send('browsingContext.close', { context });
     this.tabs.remove(context);
+    const survived = (await this.topLevelContexts()).some((c) => c.context === context);
+    if (!survived) return { kept: false };
+    this._parked = context;
+    try {
+      await this.conn.send('browsingContext.navigate', { context, url: 'about:blank', wait: 'complete' }, { timeout: 10000 });
+    } catch { /* a page that will not unload stays as it is; it is still out of the group */ }
+    return { kept: true };
+  }
+
+  _takeParked(existing) {
+    const context = this._parked;
+    this._parked = null;
+    if (!context || this.tabs.tabIdFor(context) !== undefined) return null;
+    return existing.find((c) => c.context === context) || null;
   }
 
   requireContext(tabId) {
@@ -569,5 +655,5 @@ module.exports = {
   Session, TabRegistry, ImageStore,
   toLocalValue, fromRemoteValue,
   DEFAULT_VIEWPORT, REF_BLOCK, REF_STORE_FN, RESOLVE_REF_FN, NODE_FOR_REF_FN,
-  NO_TAB, NO_REF, sleep,
+  NO_TAB, NO_REF, NO_WINDOW, CONNECT_TIMEOUT, SETUP_TIMEOUT, noWindowError, isUnresponsive, sleep,
 };
