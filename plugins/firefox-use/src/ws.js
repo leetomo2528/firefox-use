@@ -43,10 +43,17 @@ class WebSocket extends EventEmitter {
     this._socket.on('data', (chunk) => this._onData(chunk));
     this._socket.on('error', (err) => this._fail(err));
     this._socket.on('close', () => {
-      const wasOpen = this.readyState === 'open';
       this.readyState = 'closed';
-      if (wasOpen || !this._handshakeDone) this.emit('close');
+      this._emitClose();
     });
+  }
+
+  // 'close' is emitted exactly once, at the first sign the connection is over:
+  // the peer's close frame, or the socket closing, whichever comes first.
+  _emitClose() {
+    if (this._closeEmitted) return;
+    this._closeEmitted = true;
+    this.emit('close');
   }
 
   _fail(err) {
@@ -114,6 +121,10 @@ class WebSocket extends EventEmitter {
         this.readyState = 'closing';
         this._send(OP.CLOSE, frame.payload.subarray(0, 2));
         this._socket.end();
+        // A browser that is quitting says goodbye first and may hold the TCP
+        // connection open for a while after. Nothing more can be sent from
+        // here on, so the connection is over now, not when the socket goes.
+        this._emitClose();
         return;
       case OP.CONT: {
         if (this._fragOp === null) return this._fail(new Error('continuation frame without start'));

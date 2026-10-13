@@ -109,6 +109,9 @@ class BidiConnection extends EventEmitter {
         this._pending.delete(id);
         clearTimeout(timer);
         reject(err);
+        // A socket that cannot take a command is gone; say so, so the owner
+        // reconnects instead of failing every call on a dead connection.
+        this._onClose(new Error(`BiDi connection closed (${err.message})`));
       }
     });
   }

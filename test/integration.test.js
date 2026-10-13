@@ -275,6 +275,16 @@ test('a closed window, a killed browser and a restart never wedge the server', {
     assert.match(asText(await call('navigate', { tabId: firstTab(out), url: `http://127.0.0.1:${port}/parity.html` })), /parity\.html/);
   });
 
+  await t.test('a browser that quits on its own is relaunched by the next call', async () => {
+    // A quitting Firefox sends its close frame and may keep the socket open a
+    // while; the connection has to count as gone from the close frame on.
+    const session = await host.session();
+    await session.send('browser.close', {}, { timeout: 10000 }).catch(() => {});
+    await sleep(500);
+    const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    assert.ok(Number.isInteger(firstTab(out)), out);
+  });
+
   await t.test('a browser killed mid-session is relaunched by the next call', async () => {
     assert.equal(await launcher.stop({ force: true }), true);
     const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
