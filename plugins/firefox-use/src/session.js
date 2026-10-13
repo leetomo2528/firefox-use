@@ -46,11 +46,13 @@ function looksWindowless(err) {
   return err?.code === 'unknown error' || /TabManager|selectedTab|BrowserWindow/.test(err?.message || '');
 }
 
-// The connection, not the request, is what failed: retrying on a new browser can help.
+// The connection, not the request, is what failed: retrying on a new browser
+// can help. A refused upgrade belongs here too - a Firefox that is quitting
+// still holds its port and answers the WebSocket handshake with a 400.
 function isUnresponsive(err) {
   if (!err) return false;
   if (err.code === 'timeout' || ['ECONNREFUSED', 'ECONNRESET', 'EPIPE'].includes(err.code)) return true;
-  return /closed the connection|connection closed|connection is closed/i.test(err.message || '');
+  return /closed the connection|connection closed|connection is closed|WebSocket handshake failed/i.test(err.message || '');
 }
 
 // Chrome's wording, so failures read the same on either browser.

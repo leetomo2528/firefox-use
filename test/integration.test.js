@@ -280,8 +280,18 @@ test('a closed window, a killed browser and a restart never wedge the server', {
     // while; the connection has to count as gone from the close frame on.
     const session = await host.session();
     await session.send('browser.close', {}, { timeout: 10000 }).catch(() => {});
-    await sleep(500);
-    const out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    // No pause: the next call may meet Firefox mid-quit - its close frame
+    // still on the way, or its port refusing the WebSocket upgrade. One fast,
+    // explained failure is allowed; the call after it has to work.
+    const started = Date.now();
+    let out;
+    try {
+      out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    } catch (err) {
+      assert.match(err.message, /Firefox went away during this call/);
+      assert.ok(Date.now() - started < 15000, 'failed fast');
+      out = asText(await call('tabs_context_mcp', { createIfEmpty: true }));
+    }
     assert.ok(Number.isInteger(firstTab(out)), out);
   });
 

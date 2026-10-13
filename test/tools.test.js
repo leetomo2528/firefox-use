@@ -283,3 +283,22 @@ test('browser_batch items recover on their own, and the batch has no outer deadl
   assert.equal(out.isError, undefined, textOf(out));
   assert.match(textOf(out), /restarted first/);
 });
+
+test('a call cut off by the browser going away says what happened and is not re-run', async (t) => {
+  let evaluations = 0;
+  const conn = new FakeConn({
+    'browsingContext.getTree': tree('ctx-a'),
+    'script.evaluate': () => {
+      evaluations++;
+      throw new Error('BiDi connection closed');
+    },
+  });
+  stubBrowser(t, [conn]);
+  const h = host(t);
+  await h.session();
+  await assert.rejects(
+    h.callTool('javascript_tool', { action: 'javascript_exec', tabId: 1, text: '1' }),
+    /Error: BiDi connection closed\. Firefox went away during this call .* the next call reconnects/
+  );
+  assert.equal(evaluations, 1, 'not retried - it may already have had an effect');
+});

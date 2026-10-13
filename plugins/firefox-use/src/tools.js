@@ -108,6 +108,12 @@ class ToolHost {
         return withNote(result, 'Firefox was running without any window, so it was restarted first.');
       }
       if (err && err.code === 'timeout') err.message += await this._afterTimeout();
+      else if (err && /BiDi connection (is )?closed/i.test(err.message || '')) {
+        // Not retried here: whatever the call did before the browser went may
+        // have happened, and running it again could do it twice.
+        err.message = `${err.message.replace(/\.?$/, '.')} Firefox went away during this call (it quit, crashed `
+          + 'or was closed); the next call reconnects, and relaunches it if it has to.';
+      }
       throw err;
     }
   }

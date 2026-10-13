@@ -393,6 +393,18 @@ test('a browser that does not answer the connect is relaunched once', async (t) 
   assert.ok(log.lastOpts.timeout <= 15000, 'connect is bounded');
 });
 
+test('a browser that is still quitting (handshake refused) is relaunched', async (t) => {
+  const log = stubOpen(t, {
+    connect: (n) => {
+      if (n === 1) throw new Error('WebSocket handshake failed: HTTP/1.1 400 Bad Request');
+      return new FakeConn({ 'browsingContext.getTree': { contexts: [] } });
+    },
+  });
+  await Session.open({});
+  assert.equal(log.stop, 1, 'the dying browser is stopped first');
+  assert.equal(log.launch, 1);
+});
+
 test('a session.new that never answers counts as an unresponsive browser', async (t) => {
   const hung = new FakeConn({ 'session.new': () => { throw timedOut(); } });
   const log = stubOpen(t, {
