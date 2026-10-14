@@ -44,3 +44,12 @@ test('order does not matter', () => {
   assert.equal(flag('headless'), true);
   assert.equal(flag('port'), '9999');
 });
+
+test('--help and --version are commands, not a silent start of the MCP server', () => {
+  for (const spelled of ['--help', '-h', '--version', '-v']) {
+    assert.equal(parseArgs([spelled]).command, spelled);
+  }
+  // Ordinary flags with no command still mean the MCP server.
+  assert.equal(parseArgs(['--headless']).command, 'mcp');
+  assert.equal(parseArgs(['--headless']).flag('headless'), true);
+});

@@ -2,10 +2,13 @@
 // CLI argument parsing, split out so it can be tested without launching anything.
 
 const VALUE_FLAGS = new Set(['port', 'profile', 'scope', 'name']);
+// Spelled like flags, but they are commands: without this `firefox-use --help`
+// fell through to the default and sat waiting for MCP input on stdin.
+const FLAG_COMMANDS = new Set(['--help', '-h', '--version', '-v']);
 
 function parseArgs(argv) {
   const args = [...argv];
-  const command = args[0] && !args[0].startsWith('-') ? args.shift() : 'mcp';
+  const command = args[0] && (!args[0].startsWith('-') || FLAG_COMMANDS.has(args[0])) ? args.shift() : 'mcp';
   const flags = new Map();
   const positionals = [];
   for (let i = 0; i < args.length; i++) {

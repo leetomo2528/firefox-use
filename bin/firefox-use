@@ -191,6 +191,7 @@ async function main() {
 
     case 'version':
     case '--version':
+    case '-v':
       console.log(pkg.version);
       return;
 
