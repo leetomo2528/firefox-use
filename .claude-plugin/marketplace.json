@@ -6,14 +6,16 @@
   },
   "metadata": {
     "description": "Drive Firefox from Claude Code with the same browser tools it has for Chrome.",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "plugins": [
     {
       "name": "firefox-use",
       "description": "Browser control for Firefox: screenshots, clicks, typing, forms, tabs, console and network logs, file uploads and GIF recording, over WebDriver BiDi.",
-      "version": "0.2.0",
-      "author": { "name": "Yunje Lee" },
+      "version": "0.2.1",
+      "author": {
+        "name": "Yunje Lee"
+      },
       "source": "./plugins/firefox-use"
     }
   ]

@@ -1,6 +1,6 @@
 {
   "name": "firefox-use",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Computer use for Firefox: an MCP server that gives Claude Code the same browser tool surface it has for Chrome, driven over WebDriver BiDi. No dependencies.",
   "bin": {
     "firefox-use": "bin/firefox-use"
